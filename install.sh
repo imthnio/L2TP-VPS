@@ -74,7 +74,7 @@ gh_api_dl() {
 pick_dldir() {
   for _cand in /var/tmp "${HOME:-/root}" /tmp; do
     if [ -d "$_cand" ] && [ -w "$_cand" ]; then
-      _dd="${_cand}/vless-l2tp-dl"
+      _dd="${_cand}/L2TP-VPS-dl"
       if mkdir -p "$_dd" 2>/dev/null; then
         printf "%s" "$_dd"
         return 0
@@ -225,7 +225,7 @@ ask_port() { # 端口：手动输入，无默认值；校验数字/范围/占用
 [ "$(id -u)" = "0" ] || die "请用 root 运行此脚本"
 
 printf "\n${BOLD}==============================================${NC}\n"
-printf "${BOLD}   vless-l2tp：L2TP 拨号 + VLESS 节点${NC}\n"
+printf "${BOLD}   L2TP+VPS：L2TP 拨号 + VLESS 节点${NC}\n"
 printf "${BOLD}==============================================${NC}\n"
 printf "出口默认走 L2TP 隧道；L2TP 一断节点直接断网，\n"
 printf "绝不会落到德国 VPS 的 IP 上（断网保护）。\n"
