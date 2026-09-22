@@ -5,10 +5,12 @@
 #       VLESS 的出站流量经 L2TP 隧道出去（出口 IP = L2TP 分配的 IP）
 # 支持：Debian / Ubuntu / Alpine（需 root）
 #
-# 无终端时可用环境变量传入（否则会中文提示输入）：
-#   必填：L2TP_SERVER / L2TP_USER / L2TP_PASS
-#   可选：VLESS_PORT / VLESS_UUID / TRANSPORT=reality|ws /
-#         REALITY_DEST / WS_PATH
+# 流程：先问 L2TP 服务器 / 用户名 / 密码（仅密码不回显）
+#       → 装依赖、拨号 → 再问 VLESS 端口（手动输入，无默认值）
+#       / 传输方式 / REALITY 目标站 → 装 xray、输出客户端链接
+# 无终端时可用环境变量传入：
+#   必填：L2TP_SERVER / L2TP_USER / L2TP_PASS / VLESS_PORT
+#   可选：VLESS_UUID / TRANSPORT=reality|ws / REALITY_DEST / WS_PATH
 # ============================================================
 set -u
 
@@ -115,6 +117,33 @@ ask_secret() { # $1=变量名 $2=提示（密码，输入不回显）
   done
 }
 
+ask_port() { # $1=变量名 $2=提示（手动输入端口，无默认值；校验数字/范围/占用）
+  while :; do
+    _cur="$(get_var "$1")"
+    if [ "$TTY" = "1" ]; then
+      printf '%s（纯数字，1-65535）: ' "$2"
+      IFS= read -r _ans || _ans=""
+      [ -z "$_ans" ] && _ans="$_cur"
+    else
+      _ans="$_cur"
+    fi
+    case "$_ans" in ''|*[!0-9]*)
+      if [ "$TTY" = "1" ]; then echo "端口必须是纯数字，请重新输入"; continue; fi
+      die "$2 无效（无终端时请用环境变量 $1 传入纯数字端口）" ;;
+    esac
+    if [ "$_ans" -lt 1 ] || [ "$_ans" -gt 65535 ]; then
+      if [ "$TTY" = "1" ]; then echo "端口范围 1-65535，请重新输入"; continue; fi
+      die "$2 超出范围 1-65535"
+    fi
+    if ss -lnt 2>/dev/null | grep -q ":${_ans} "; then
+      if [ "$TTY" = "1" ]; then echo "端口 ${_ans} 已被占用，请换一个"; continue; fi
+      die "端口 ${_ans} 已被占用"
+    fi
+    set_var "$1" "$_ans"
+    break
+  done
+}
+
 echo "=============================================="
 echo " vless-l2tp 一键脚本"
 echo " L2TP 拨号 + VLESS 节点，出口走 L2TP 隧道"
@@ -124,71 +153,8 @@ echo ""
 ask_req    L2TP_SERVER "L2TP 服务器地址（IP 或域名）"
 ask_req    L2TP_USER   "L2TP 用户名"
 ask_secret L2TP_PASS   "L2TP 密码"
-ask_def    VLESS_PORT  "VLESS 端口" "443"
-case "$VLESS_PORT" in ''|*[!0-9]*) die "端口必须是数字" ;; esac
-[ "$VLESS_PORT" -ge 1 ] && [ "$VLESS_PORT" -le 65535 ] || die "端口范围 1-65535"
 
-_auto_uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "")"
-ask_def VLESS_UUID "VLESS UUID（回车自动生成）" "$_auto_uuid"
-[ -n "$VLESS_UUID" ] || die "UUID 生成失败，请手动输入一个"
-
-case "$TRANSPORT" in reality|ws) ;; *) TRANSPORT="" ;; esac
-if [ -z "$TRANSPORT" ]; then
-  if [ "$TTY" = "1" ]; then
-    echo ""
-    echo "传输方式："
-    echo "  1) TCP + REALITY（默认，推荐）"
-    echo "  2) WebSocket（明文，简单）"
-  fi
-  ask_def TRANS_CHOICE "请选择 [1/2]" "1"
-  case "$TRANS_CHOICE" in
-    2|ws|WS) TRANSPORT="ws" ;;
-    *)       TRANSPORT="reality" ;;
-  esac
-fi
-
-if [ "$TRANSPORT" = "reality" ]; then
-  if [ -z "$REALITY_DEST" ]; then
-    if [ "$TTY" = "1" ]; then
-      echo ""
-      echo "REALITY 目标网站（伪装对象）："
-      echo "  1) www.samsung.com                     2018-2026 零干扰，最稳"
-      echo "  2) www.cisco.com                       2026 年 0% 干扰，TLS 极稳"
-      echo "  3) itunes.apple.com                    2025-2026 全干净"
-      echo "  4) www.python.org                      技术站，小众不扎眼"
-      echo "  5) m.media-amazon.com                  零干扰记录"
-      echo "  6) images-na.ssl-images-amazon.com      图片 CDN，流量普通"
-      echo "  7) download-installer.cdn.mozilla.net  火狐下载站"
-      echo "  8) www.lovelive-anime.jp               日本动画官网，小厂气质"
-      echo "  9) academy.nvidia.com"
-      echo " 10) lol.secure.dyn.riotcdn.net          游戏补丁 CDN"
-      echo " 11) s0.awsstatic.com"
-      echo " 12) www.amd.com                         有 3% 干扰率，只当备胎"
-      ask_def REALITY_CHOICE "请选择 [1-12]" "1"
-      case "$REALITY_CHOICE" in
-        1)  _rd="www.samsung.com" ;;
-        2)  _rd="www.cisco.com" ;;
-        3)  _rd="itunes.apple.com" ;;
-        4)  _rd="www.python.org" ;;
-        5)  _rd="m.media-amazon.com" ;;
-        6)  _rd="images-na.ssl-images-amazon.com" ;;
-        7)  _rd="download-installer.cdn.mozilla.net" ;;
-        8)  _rd="www.lovelive-anime.jp" ;;
-        9)  _rd="academy.nvidia.com" ;;
-        10) _rd="lol.secure.dyn.riotcdn.net" ;;
-        11) _rd="s0.awsstatic.com" ;;
-        12) _rd="www.amd.com" ;;
-        *)  _rd="www.samsung.com" ;;
-      esac
-      REALITY_DEST="${_rd}:443"
-    else
-      REALITY_DEST="www.samsung.com:443"
-    fi
-  fi
-else
-  ask_def WS_PATH "WebSocket 路径" "/ws"
-  case "$WS_PATH" in /*) ;; *) WS_PATH="/$WS_PATH" ;; esac
-fi
+# VLESS 相关输入（端口 / 传输方式 / 伪装站）挪到 L2TP 拨号完成之后再问
 echo ""
 
 # ---------- 系统识别与依赖 ----------
@@ -366,6 +332,70 @@ else
   info "隧道已建立：$PPP_IF，IP = ${PPP_IP:-未知}"
 fi
 
+# ---------- 第二阶段输入：VLESS 端口（手动输入）/ 传输方式 / 伪装站 ----------
+echo ""
+echo "---------- 下面配置 VLESS 节点 ----------"
+ask_port VLESS_PORT "VLESS 端口"
+
+case "$TRANSPORT" in reality|ws) ;; *) TRANSPORT="" ;; esac
+if [ -z "$TRANSPORT" ]; then
+  if [ "$TTY" = "1" ]; then
+    echo ""
+    echo "传输方式："
+    echo "  1) TCP + REALITY（默认，推荐）"
+    echo "  2) WebSocket（明文，简单）"
+  fi
+  ask_def TRANS_CHOICE "请选择 [1/2]" "1"
+  case "$TRANS_CHOICE" in
+    2|ws|WS) TRANSPORT="ws" ;;
+    *)       TRANSPORT="reality" ;;
+  esac
+fi
+
+if [ "$TRANSPORT" = "reality" ]; then
+  if [ -z "$REALITY_DEST" ]; then
+    if [ "$TTY" = "1" ]; then
+      echo ""
+      echo "REALITY 目标网站（伪装对象）："
+      echo "  1) www.samsung.com                     2018-2026 零干扰，最稳"
+      echo "  2) www.cisco.com                       2026 年 0% 干扰，TLS 极稳"
+      echo "  3) itunes.apple.com                    2025-2026 全干净"
+      echo "  4) www.python.org                      技术站，小众不扎眼"
+      echo "  5) m.media-amazon.com                  零干扰记录"
+      echo "  6) images-na.ssl-images-amazon.com      图片 CDN，流量普通"
+      echo "  7) download-installer.cdn.mozilla.net  火狐下载站"
+      echo "  8) www.lovelive-anime.jp               日本动画官网，小厂气质"
+      echo "  9) academy.nvidia.com"
+      echo " 10) lol.secure.dyn.riotcdn.net          游戏补丁 CDN"
+      echo " 11) s0.awsstatic.com"
+      echo " 12) www.amd.com                         有 3% 干扰率，只当备胎"
+      ask_def REALITY_CHOICE "请选择 [1-12]" "1"
+      case "$REALITY_CHOICE" in
+        1)  _rd="www.samsung.com" ;;
+        2)  _rd="www.cisco.com" ;;
+        3)  _rd="itunes.apple.com" ;;
+        4)  _rd="www.python.org" ;;
+        5)  _rd="m.media-amazon.com" ;;
+        6)  _rd="images-na.ssl-images-amazon.com" ;;
+        7)  _rd="download-installer.cdn.mozilla.net" ;;
+        8)  _rd="www.lovelive-anime.jp" ;;
+        9)  _rd="academy.nvidia.com" ;;
+        10) _rd="lol.secure.dyn.riotcdn.net" ;;
+        11) _rd="s0.awsstatic.com" ;;
+        12) _rd="www.amd.com" ;;
+        *)  _rd="www.samsung.com" ;;
+      esac
+      REALITY_DEST="${_rd}:443"
+    else
+      REALITY_DEST="www.samsung.com:443"
+    fi
+  fi
+else
+  ask_def WS_PATH "WebSocket 路径" "/ws"
+  case "$WS_PATH" in /*) ;; *) WS_PATH="/$WS_PATH" ;; esac
+fi
+echo ""
+
 # ---------- 安装 xray ----------
 if [ ! -x /usr/local/bin/xray ]; then
   case "$(uname -m)" in
@@ -383,7 +413,9 @@ if [ ! -x /usr/local/bin/xray ]; then
   rm -rf "$T"
 fi
 
-# ---------- 生成 xray 配置 ----------
+# ---------- 生成 xray 配置（UUID 自动生成，不用手动输入） ----------
+[ -n "$VLESS_UUID" ] || VLESS_UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
+[ -n "$VLESS_UUID" ] || die "UUID 生成失败"
 if [ "$TRANSPORT" = "reality" ]; then
   _kp="$(/usr/local/bin/xray x25519)"
   PRIV_KEY="$(printf '%s' "$_kp" | awk '/Private key:/{print $3}')"
