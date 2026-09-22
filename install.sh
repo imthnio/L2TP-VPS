@@ -17,7 +17,6 @@
 #   隧道恢复后自动恢复，不用重跑脚本。
 #   （注意：整台 VPS 的默认路由不动，不然 L2TP 一断你连 SSH 都上不去。）
 #
-# 装完：输入 jiedian 随时看节点；输入 xiezai 一键卸载干净。
 # 无终端时可用环境变量：
 #   必填：L2TP_SERVER / L2TP_USER / L2TP_PASS / VLESS_PORT
 #   可选：VLESS_UUID / TRANSPORT=reality|ws / REALITY_DEST / WS_PATH
@@ -83,12 +82,6 @@ pick_dldir() {
     fi
   done
   return 1
-}
-
-# mark_our_bin：记录内核是脚本自己下载的，卸载时才删
-mark_our_bin() {
-  mkdir -p "$NODE_DIR" 2>/dev/null
-  grep -qx "$1" "$NODE_DIR/our_bins" 2>/dev/null || echo "$1" >> "$NODE_DIR/our_bins"
 }
 
 # wait_for_port <端口> <超时秒>：硬检查端口真的在监听
@@ -572,7 +565,6 @@ else
   [ -s "$DL_DIR/xray-dl/xray" ] || die "解压后没找到 xray 文件"
   install -m 0755 "$DL_DIR/xray-dl/xray" "$XRAY_BIN" || die "安装 Xray 失败"
   "$XRAY_BIN" version >/dev/null 2>&1 || die "装完的 Xray 跑不起来，安装包可能有问题"
-  mark_our_bin "xray"
   rm -rf "$DL_DIR"
   info "Xray 安装成功：$($XRAY_BIN version 2>/dev/null | head -1)"
 fi
@@ -797,133 +789,10 @@ fi
   printf "出口 IP: %s（走英国 L2TP）\n" "$UK_IP"
   printf "断网保护: L2TP 断开后节点直接断网，不会用德国 IP 出口\n"
   printf -- "----------------------------------------------\n"
-  printf "以后想看节点，直接输入: jiedian\n"
-  printf "不想要了，输入: xiezai 一键卸载\n"
+  printf "节点信息保存在: /etc/l2tp-vless/node.txt\n"
   printf "==============================================\n"
 } > "$NODE_DIR/node.txt"
 chmod 600 "$NODE_DIR/node.txt"
-
-cat > /usr/local/bin/jiedian <<'JDEOF'
-#!/bin/sh
-# 输入 jiedian，立刻显示你的节点 + L2TP 实时状态
-if [ -f /etc/l2tp-vless/node.txt ]; then
-  cat /etc/l2tp-vless/node.txt
-else
-  echo "还没安装节点，请先运行一键安装脚本"
-  exit 0
-fi
-printf "\n--- L2TP 隧道实时状态 ---\n"
-if ip -o link show 2>/dev/null | grep -qE 'ppp[0-9]+'; then
-  _pif=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^ppp[0-9]+$' | head -1)
-  _pip=$(ip -4 -o addr show dev "$_pif" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-  printf "隧道接口：%s，隧道 IP：%s\n" "$_pif" "${_pip:-未知}"
-  _uk=$(curl --interface "$_pif" -s --max-time 10 https://ifconfig.me 2>/dev/null || echo "")
-  printf "当前出口 IP：%s\n" "${_uk:-检测失败}"
-else
-  echo "隧道未建立（L2TP 断开时节点断网是正常的，续费重连后自动恢复）"
-fi
-echo "策略路由表（table 100）："
-ip route show table 100 2>/dev/null | sed 's/^/  /'
-JDEOF
-chmod +x /usr/local/bin/jiedian
-info "已安装 jiedian 命令：以后输入 jiedian 就能看节点"
-
-cat > /usr/local/bin/xiezai <<'XZEOF'
-#!/bin/sh
-# 输入 xiezai，一键卸载 vless-l2tp：停服务、删配置、清路由规则、撤防火墙
-echo "正在卸载 vless-l2tp…"
-
-# 停掉 xray
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-  systemctl stop xray >/dev/null 2>&1
-  systemctl disable xray >/dev/null 2>&1
-  rm -f /etc/systemd/system/xray.service
-fi
-if command -v rc-service >/dev/null 2>&1; then
-  rc-service xray stop >/dev/null 2>&1
-  rc-update del xray default >/dev/null 2>&1
-  rm -f /etc/init.d/xray
-fi
-[ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
-pkill -x xray >/dev/null 2>&1
-
-# 断开 L2TP，清理拨号相关服务
-if [ -e /var/run/xl2tpd/l2tp-control ]; then
-  echo "d uk" > /var/run/xl2tpd/l2tp-control 2>/dev/null || true
-  sleep 2
-fi
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-  systemctl stop xl2tpd >/dev/null 2>&1
-  systemctl disable xl2tpd l2tp-vless-route l2tp-vless-dial >/dev/null 2>&1
-  rm -f /etc/systemd/system/l2tp-vless-route.service /etc/systemd/system/l2tp-vless-dial.service
-  systemctl daemon-reload >/dev/null 2>&1
-fi
-if command -v rc-service >/dev/null 2>&1; then
-  rc-service xl2tpd stop >/dev/null 2>&1
-  rc-update del xl2tpd default >/dev/null 2>&1
-  rm -f /etc/local.d/l2tp-vless.start
-fi
-pkill -x xl2tpd >/dev/null 2>&1
-pkill -x pppd >/dev/null 2>&1
-sleep 1
-
-# 清策略路由表与规则
-ip route flush table 100 2>/dev/null || true
-while ip rule list 2>/dev/null | grep -q "fwmark 0x64"; do
-  ip rule del fwmark 100 table 100 2>/dev/null || break
-done
-# 删 L2TP 服务器主机路由
-if [ -f /etc/l2tp-vless/net.env ]; then
-  . /etc/l2tp-vless/net.env
-  if [ -n "${SERVER:-}" ]; then
-    _sip=$(getent hosts "$SERVER" 2>/dev/null | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $1; exit}')
-    [ -n "$_sip" ] && ip route del "$_sip" 2>/dev/null || true
-  fi
-fi
-
-# 撤销安装时加的防火墙规则（只删我们加过的那条）
-if [ -f /etc/l2tp-vless/fw_info ]; then
-  read -r _fport _fproto < /etc/l2tp-vless/fw_info
-  if [ -n "$_fport" ] && [ -n "$_fproto" ]; then
-    if command -v ufw >/dev/null 2>&1; then
-      ufw delete allow "$_fport"/"$_fproto" >/dev/null 2>&1
-    fi
-    if command -v firewall-cmd >/dev/null 2>&1; then
-      firewall-cmd --permanent --remove-port="$_fport"/"$_fproto" >/dev/null 2>&1
-      firewall-cmd --reload >/dev/null 2>&1
-    fi
-    if command -v iptables >/dev/null 2>&1; then
-      while iptables -C INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1; do
-        iptables -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1
-      done
-    fi
-    echo "已撤销端口 $_fport/$_fproto 的防火墙放行"
-  fi
-fi
-
-# 只删脚本自己下载的内核（our_bins 里记着），用户本来就有的不碰
-if [ -f /etc/l2tp-vless/our_bins ]; then
-  while read -r _b; do
-    case "$_b" in
-      xray) rm -f /usr/local/bin/xray && echo "已删除脚本安装的 xray" ;;
-    esac
-  done < /etc/l2tp-vless/our_bins
-fi
-
-# 删配置文件与脚本
-rm -rf /usr/local/etc/xray /etc/l2tp-vless
-rm -rf /etc/xl2tpd /etc/ppp/options.l2tp-vless
-rm -f /etc/ppp/chap-secrets
-rm -f /etc/ppp/ip-up.d/10-vless-egress /etc/ppp/ip-down.d/10-vless-egress
-rm -f /usr/local/sbin/l2tp-vless-route.sh /usr/local/sbin/l2tp-vless-killswitch.sh
-rm -f /var/log/xray.log
-rm -f /usr/local/bin/jiedian
-rm -f /usr/local/bin/xiezai
-
-echo "卸载完成：节点、L2TP 配置、路由规则、防火墙规则都已清除干净。"
-XZEOF
-chmod +x /usr/local/bin/xiezai
-info "已安装 xiezai 命令：输入 xiezai 可一键卸载干净"
 
 # ---------- 12. 显示结果 ----------
 printf "\n"
@@ -931,4 +800,4 @@ cat "$NODE_DIR/node.txt"
 printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
 printf "VLESS 入口：${BOLD}%s:%s${NC}（德国 VPS）\n" "$DE_IP" "$VLESS_PORT"
 printf "VLESS 出口：${BOLD}%s${NC}（英国 L2TP）\n" "$UK_IP"
-printf "以后看节点输入 ${BOLD}jiedian${NC}，不想要了输入 ${BOLD}xiezai${NC} 一键卸载。\n"
+printf "节点信息保存在 ${BOLD}/etc/l2tp-vless/node.txt${NC}，随时可以 cat 查看。\n"
