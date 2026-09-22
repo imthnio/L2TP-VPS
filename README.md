@@ -2,7 +2,7 @@
 
 德国 VPS 一键脚本：xl2tpd 拨号 L2TP（英国）+ 搭建 VLESS 节点。VLESS 的出站默认走 L2TP 隧道，出口 IP 是英国 IP。
 
-节点搭建部分参考 [dajianjiedian](https://github.com/imthnio/dajianjiedian) 的小白风格：彩色分步骤输出、GitHub API 下载、端口硬检查、`jiedian` 查看、`xiezai` 卸载。
+节点搭建部分参考 [dajianjiedian](https://github.com/imthnio/dajianjiedian) 的小白风格：彩色分步骤输出、GitHub API 下载、端口硬检查。
 
 ## 一行安装
 
@@ -39,10 +39,7 @@ VLESS 出站包打 fwmark 标记，只查路由表 table 100。table 100 里永�
 
 整台 VPS 的默认路由不动（不然 L2TP 一断你连 SSH 都上不去）；L2TP 服务器本身有主机路由走原始网关，避免隧道自环；ppp0 上对 TCP 做 MSS 钳制，防 PMTU 黑洞。
 
-## 常用命令
-
-- `jiedian`：显示节点链接 + L2TP 隧道实时状态（隧道 IP、出口 IP、table 100）
-- `xiezai`：一键卸载（停服务、删 L2TP 配置、清路由规则、撤防火墙、删 xray）
+节点信息保存在 `/etc/l2tp-vless/node.txt`，随时可以 `cat` 查看。
 
 ## 注意
 
