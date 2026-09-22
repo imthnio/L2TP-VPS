@@ -19,7 +19,7 @@ curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 \
 - L2TP 密码（输入不回显）
 
 第二阶段（拨号完成后，配置节点）：
-- VLESS 端口（手动输入纯数字，无默认值；输错或被占用会提示重输）
+- 端口（手动输入纯数字，无默认值；输错或被占用会提示重输）
 - 传输方式：1) TCP + REALITY（默认，推荐） 2) WebSocket 明文
 - REALITY 目标网站 12 选 1（默认 `www.samsung.com`，另有 cisco / itunes.apple / python.org / amazon 系 / mozilla / lovelive-anime.jp / nvidia / riotcdn / awsstatic / amd 备选）/ WS 路径（默认 `/ws`）
 
