@@ -230,7 +230,7 @@ printf "${BOLD}==============================================${NC}\n"
 printf "出口默认走 L2TP 隧道；L2TP 一断节点直接断网，\n"
 printf "绝不会落到德国 VPS 的 IP 上（断网保护）。\n"
 
-if [ -f "$NODE_DIR/node.txt" ]; then
+if [ -f "$NODE_DIR/net.env" ]; then
   warn "检测到已经安装过节点，继续会覆盖重装。"
   if [ "$TTY" = "1" ]; then
     printf '继续重装吗？(y/n) [默认 y]: '
@@ -813,15 +813,11 @@ fi
   printf "出口 IP: %s（走英国 L2TP）\n" "$UK_IP"
   printf "断网保护: L2TP 断开后节点直接断网，不会用德国 IP 出口\n"
   printf -- "----------------------------------------------\n"
-  printf "节点信息保存在: /etc/l2tp-vless/node.txt\n"
   printf "==============================================\n"
-} > "$NODE_DIR/node.txt"
-chmod 600 "$NODE_DIR/node.txt"
+}
 
 # ---------- 12. 显示结果 ----------
 printf "\n"
-cat "$NODE_DIR/node.txt"
 printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
 printf "VLESS 入口：${BOLD}%s:%s${NC}（德国 VPS）\n" "$DE_IP" "$VLESS_PORT"
 printf "VLESS 出口：${BOLD}%s${NC}（英国 L2TP）\n" "$UK_IP"
-printf "节点信息保存在 ${BOLD}/etc/l2tp-vless/node.txt${NC}，随时可以 cat 查看。\n"
