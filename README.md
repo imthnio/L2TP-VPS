@@ -31,3 +31,7 @@ IPv4 和 IPv6 都覆盖：隧道分到公网 IPv6 的话，IPv6 出站同样走�
 
 整台 VPS 的默认路由不动（不然 L2TP 一断你连 SSH 都上不去）；L2TP 服务器本身有主机路由走原始网关，避免隧道自环；ppp0 上对 TCP 做 MSS 钳制，防 PMTU 黑洞。
 
+DNS 查询也走隧道：xray 内建 DNS（8.8.8.8 / 1.1.1.1）经打标出站，访问了哪些域名不会在明文 DNS 里暴露给 VPS 商；隧道断时 DNS 同样被丢弃（不断网保护的一致性）。
+
+Alpine 兼容：Alpine 的 xl2tpd 包不带 OpenRC 脚本、且 pppd 不执行 `ip-up.d/` 钩子，脚本会自动补上这两块，Debian/Ubuntu 不受影响。
+
