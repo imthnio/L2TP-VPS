@@ -1,14 +1,24 @@
 #!/bin/sh
 # ============================================================
-# vless-l2tp 一键安装脚本
-# 功能：在 VPS 上用 xl2tpd 拨号 L2TP，并在本机搭建 VLESS 节点，
-#       VLESS 的出站流量经 L2TP 隧道出去（出口 IP = L2TP 分配的 IP）
-# 支持：Debian / Ubuntu / Alpine（需 root）
+# vless-l2tp 一键安装脚本（小白版，节点搭建部分参考 dajianjiedian）
 #
-# 流程：先问 L2TP 服务器 / 用户名 / 密码（仅密码不回显）
-#       → 装依赖、拨号 → 再问 VLESS 端口（手动输入，无默认值）
-#       / 传输方式 / REALITY 目标站 → 装 xray、输出客户端链接
-# 无终端时可用环境变量传入：
+# 流程：
+#   1. 先问 L2TP 服务器 / 用户名 / 密码（仅密码不回显）
+#   2. 装依赖 → 写 L2TP 配置 → 拨号（拿 ppp0 与英国 IP）
+#   3. 再问 VLESS 端口（手动输入，无默认值）
+#      / 传输方式 / REALITY 伪装站（12 选 1）
+#   4. 装 xray → 写配置 → 启动 → 输出客户端链接
+#
+# 出口：VLESS 出站默认走 L2TP 隧道（fwmark 策略路由）。
+# 断网保护：table 100 里永远只有一条默认路由——
+#   隧道通时是 default dev ppp0，隧道断时是 prohibit default。
+#   L2TP 一断（比如忘记续费），VLESS 出站直接被丢弃，
+#   节点断网，绝不会落到德国 VPS 的 IP 上。
+#   隧道恢复后自动恢复，不用重跑脚本。
+#   （注意：整台 VPS 的默认路由不动，不然 L2TP 一断你连 SSH 都上不去。）
+#
+# 装完：输入 jiedian 随时看节点；输入 xiezai 一键卸载干净。
+# 无终端时可用环境变量：
 #   必填：L2TP_SERVER / L2TP_USER / L2TP_PASS / VLESS_PORT
 #   可选：VLESS_UUID / TRANSPORT=reality|ws / REALITY_DEST / WS_PATH
 # ============================================================
@@ -17,15 +27,89 @@ set -u
 FW_MARK=100
 RT_TABLE=100
 LAC_NAME="uk"
+NODE_DIR="/etc/l2tp-vless"
+XRAY_CONF_DIR="/usr/local/etc/xray"
+XRAY_BIN="/usr/local/bin/xray"
 
-info()  { printf '\033[32m[INFO]\033[0m %s\n' "$*"; }
-warn()  { printf '\033[33m[WARN]\033[0m %s\n' "$*"; }
-error() { printf '\033[31m[ERROR]\033[0m %s\n' "$*"; }
-die()   { error "$*"; exit 1; }
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+info() { printf "${GREEN}[OK]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[注意]${NC} %s\n" "$1"; }
+err()  { printf "${RED}[出错]${NC} %s\n" "$1"; }
+step() { printf "\n${CYAN}${BOLD}%s${NC}\n" "$1"; }
+die()  { err "$1"; exit 1; }
 
-[ "$(id -u)" = "0" ] || die "请用 root 运行此脚本"
+# ---------- 通用小工具（参考 dajianjiedian） ----------
+rand_hex() { # rand_hex 字节数 -> 十六进制串
+  od -An -tx1 -N"$1" /dev/urandom 2>/dev/null | tr -d ' \n'
+}
 
-# ---------- 输入（环境变量优先，无终端时必填项必须给环境变量） ----------
+gen_uuid() {
+  if [ -r /proc/sys/kernel/random/uuid ]; then
+    tr 'A-Z' 'a-z' < /proc/sys/kernel/random/uuid | tr -d '\n'
+  else
+    rand_hex 16 | sed 's/^\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/'
+  fi
+}
+
+get_ip() { # 只取 IPv4 公网 IP，多个网站轮着试
+  for _u in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com"; do
+    _ip=$(curl -fsSL --max-time 10 -4 "$_u" 2>/dev/null | tr -d ' \r\n')
+    if [ -n "$_ip" ]; then printf "%s" "$_ip"; return 0; fi
+  done
+  return 1
+}
+
+# gh_api_dl <仓库> <文件名> <输出路径>：走 GitHub API 下载 release 文件
+gh_api_dl() {
+  _gh_repo="$1"; _gh_asset="$2"; _gh_out="$3"
+  _gh_rel=$(curl -fsSL --max-time 20 "https://api.github.com/repos/${_gh_repo}/releases/latest" 2>/dev/null) || return 1
+  [ -n "$_gh_rel" ] || return 1
+  _gh_aid=$(printf "%s\n" "$_gh_rel" | grep -B10 -F "\"name\": \"${_gh_asset}\"" | grep '"id"' | tail -1 | grep -o '[0-9][0-9]*' | head -1)
+  [ -n "$_gh_aid" ] || return 1
+  curl -fSL --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 \
+    -H "Accept: application/octet-stream" \
+    -o "$_gh_out" "https://api.github.com/repos/${_gh_repo}/releases/assets/${_gh_aid}"
+}
+
+# pick_dldir：选磁盘上的下载目录（/tmp 可能是内存盘）
+pick_dldir() {
+  for _cand in /var/tmp "${HOME:-/root}" /tmp; do
+    if [ -d "$_cand" ] && [ -w "$_cand" ]; then
+      _dd="${_cand}/vless-l2tp-dl"
+      if mkdir -p "$_dd" 2>/dev/null; then
+        printf "%s" "$_dd"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+# mark_our_bin：记录内核是脚本自己下载的，卸载时才删
+mark_our_bin() {
+  mkdir -p "$NODE_DIR" 2>/dev/null
+  grep -qx "$1" "$NODE_DIR/our_bins" 2>/dev/null || echo "$1" >> "$NODE_DIR/our_bins"
+}
+
+# wait_for_port <端口> <超时秒>：硬检查端口真的在监听
+wait_for_port() {
+  _wp="$1"; _wtimeout="${2:-15}"
+  _wtry=0
+  while [ "$_wtry" -lt "$_wtimeout" ]; do
+    if command -v ss >/dev/null 2>&1; then
+      ss -ltn 2>/dev/null | grep -q ":${_wp} " && return 0
+    elif command -v netstat >/dev/null 2>&1; then
+      netstat -ltn 2>/dev/null | grep -q ":${_wp} " && return 0
+    else
+      return 0
+    fi
+    sleep 1
+    _wtry=$((_wtry + 1))
+  done
+  return 1
+}
+
+# ---------- 安全的变量读写（避免 eval 注入，密码里有特殊字符也不怕） ----------
 L2TP_SERVER="${L2TP_SERVER:-}"
 L2TP_USER="${L2TP_USER:-}"
 L2TP_PASS="${L2TP_PASS:-}"
@@ -70,7 +154,7 @@ set_var() {
   esac
 }
 
-ask_req() { # $1=变量名 $2=提示（必填）
+ask_req() { # 必填项
   while :; do
     _cur="$(get_var "$1")"
     if [ "$TTY" = "1" ]; then
@@ -86,7 +170,7 @@ ask_req() { # $1=变量名 $2=提示（必填）
   done
 }
 
-ask_def() { # $1=变量名 $2=提示 $3=默认值
+ask_def() { # 有默认值的选项
   _cur="$(get_var "$1")"
   if [ "$TTY" = "1" ]; then
     printf '%s [默认 %s]: ' "$2" "$3"
@@ -98,7 +182,7 @@ ask_def() { # $1=变量名 $2=提示 $3=默认值
   fi
 }
 
-ask_secret() { # $1=变量名 $2=提示（密码，输入不回显）
+ask_secret() { # 密码，输入不回显
   while :; do
     _cur="$(get_var "$1")"
     if [ "$TTY" = "1" ]; then
@@ -117,7 +201,7 @@ ask_secret() { # $1=变量名 $2=提示（密码，输入不回显）
   done
 }
 
-ask_port() { # $1=变量名 $2=提示（手动输入端口，无默认值；校验数字/范围/占用）
+ask_port() { # 端口：手动输入，无默认值；校验数字/范围/占用
   while :; do
     _cur="$(get_var "$1")"
     if [ "$TTY" = "1" ]; then
@@ -144,20 +228,35 @@ ask_port() { # $1=变量名 $2=提示（手动输入端口，无默认值；校�
   done
 }
 
-echo "=============================================="
-echo " vless-l2tp 一键脚本"
-echo " L2TP 拨号 + VLESS 节点，出口走 L2TP 隧道"
-echo "=============================================="
-echo ""
+# ---------- 0. 必须是 root ----------
+[ "$(id -u)" = "0" ] || die "请用 root 运行此脚本"
 
+printf "\n${BOLD}==============================================${NC}\n"
+printf "${BOLD}   vless-l2tp：L2TP 拨号 + VLESS 节点${NC}\n"
+printf "${BOLD}==============================================${NC}\n"
+printf "出口默认走 L2TP 隧道；L2TP 一断节点直接断网，\n"
+printf "绝不会落到德国 VPS 的 IP 上（断网保护）。\n"
+
+if [ -f "$NODE_DIR/node.txt" ]; then
+  warn "检测到已经安装过节点，继续会覆盖重装。"
+  if [ "$TTY" = "1" ]; then
+    printf '继续重装吗？(y/n) [默认 y]: '
+    IFS= read -r _re || _re=""
+    [ -z "$_re" ] && _re="y"
+    case "$_re" in y|Y|yes|YES) ;; *) echo "已取消"; exit 0 ;; esac
+  else
+    warn "无终端，默认继续覆盖重装"
+  fi
+fi
+
+# ---------- 1. 第一阶段：L2TP 账号 ----------
+step "[1/2] 先填 L2TP 账号（输完就开始拨号）"
 ask_req    L2TP_SERVER "L2TP 服务器地址（IP 或域名）"
 ask_req    L2TP_USER   "L2TP 用户名"
 ask_secret L2TP_PASS   "L2TP 密码"
 
-# VLESS 相关输入（端口 / 传输方式 / 伪装站）挪到 L2TP 拨号完成之后再问
-echo ""
-
-# ---------- 系统识别与依赖 ----------
+# ---------- 2. 装依赖（缺啥装啥） ----------
+step "[准备] 检查系统工具…"
 if [ -f /etc/alpine-release ]; then
   OS="alpine"
 elif [ -f /etc/debian_version ]; then
@@ -165,25 +264,40 @@ elif [ -f /etc/debian_version ]; then
 else
   die "仅支持 Debian / Ubuntu / Alpine"
 fi
-info "系统：$OS"
-
-if [ "$OS" = "alpine" ]; then
-  apk add --no-cache xl2tpd curl unzip iproute2 iptables 2>&1 | tail -1
-else
+_missing=""
+command -v curl >/dev/null 2>&1 || _missing="$_missing curl"
+command -v unzip >/dev/null 2>&1 || _missing="$_missing unzip"
+command -v ss >/dev/null 2>&1 || _missing="$_missing iproute2"
+command -v iptables >/dev/null 2>&1 || _missing="$_missing iptables"
+command -v xl2tpd >/dev/null 2>&1 || _missing="$_missing xl2tpd"
+if [ -n "$_missing" ]; then
+  printf "正在安装缺失的软件包：%s（最多等几分钟）…\n" "$_missing"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq 2>&1 | tail -1
-  apt-get install -y -qq xl2tpd curl unzip iproute2 iptables 2>&1 | tail -1
+  if [ "$OS" = "alpine" ]; then
+    apk add --no-cache $_missing ca-certificates >/dev/null 2>&1
+  else
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq $_missing ca-certificates >/dev/null 2>&1
+  fi
+  unset DEBIAN_FRONTEND
 fi
+for _b in curl unzip ss iptables xl2tpd; do
+  command -v "$_b" >/dev/null 2>&1 || die "缺少 $_b，自动安装失败，请手动安装后重试"
+done
+info "系统工具就绪"
 
-# ---------- 记录原始默认路由（L2TP 服务器必须走这条，否则隧道自环） ----------
+# ---------- 3. L2TP 配置 ----------
+step "[拨号] 配置 L2TP…"
+
+# 记录原始默认路由：L2TP 服务器必须走这条，否则隧道自环
 DEF_GW="$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')"
 DEF_IF="$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')"
 [ -n "$DEF_GW" ] && [ -n "$DEF_IF" ] || die "获取默认路由失败"
 info "原始网关：$DEF_GW，经由 $DEF_IF"
-mkdir -p /etc/l2tp-vless
-printf 'GW=%s\nIF=%s\nSERVER=%s\n' "$DEF_GW" "$DEF_IF" "$L2TP_SERVER" > /etc/l2tp-vless/net.env
+mkdir -p "$NODE_DIR"
+printf 'GW=%s\nIF=%s\nSERVER=%s\n' "$DEF_GW" "$DEF_IF" "$L2TP_SERVER" > "$NODE_DIR/net.env"
 
-# ---------- 保路由脚本（开机 / 拨号前执行） ----------
+# 保路由脚本：L2TP 服务器 IP 始终走原始网关
 cat > /usr/local/sbin/l2tp-vless-route.sh <<'EOF'
 #!/bin/sh
 # 保证 L2TP 服务器 IP 始终走原始网关，防止隧道流量被策略路由吸走导致自环
@@ -196,7 +310,20 @@ ip route replace "$SIP" via "$GW" dev "$IF" 2>/dev/null || true
 EOF
 chmod +x /usr/local/sbin/l2tp-vless-route.sh
 
-# ---------- xl2tpd 配置 ----------
+# 断网保护脚本：table 100 里永远只有一条默认路由
+cat > /usr/local/sbin/l2tp-vless-killswitch.sh <<EOF
+#!/bin/sh
+# 断网保护：fwmark ${FW_MARK} 的包只查 table ${RT_TABLE}。
+# 隧道通 → default dev pppX；隧道断 → prohibit default 直接丢弃。
+# L2TP 一断（比如忘记续费），VLESS 出站直接断网，
+# 绝不会落到德国 VPS 的 IP 上。隧道恢复后自动恢复。
+ip rule list 2>/dev/null | grep -q "fwmark 0x64 lookup ${RT_TABLE}" \\
+  || ip rule add fwmark ${FW_MARK} table ${RT_TABLE} 2>/dev/null || true
+ip route show table ${RT_TABLE} 2>/dev/null | grep -q "^default" \\
+  || ip route add prohibit default table ${RT_TABLE} 2>/dev/null || true
+EOF
+chmod +x /usr/local/sbin/l2tp-vless-killswitch.sh
+
 mkdir -p /etc/xl2tpd /etc/ppp
 cat > /etc/xl2tpd/xl2tpd.conf <<EOF
 [global]
@@ -232,15 +359,15 @@ EOF
 printf '"%s" * "%s" *\n' "$L2TP_USER" "$L2TP_PASS" > /etc/ppp/chap-secrets
 chmod 600 /etc/ppp/chap-secrets /etc/ppp/options.l2tp-vless
 
-# ---------- ppp 拨号成功 / 断开钩子：维护策略路由表 ----------
+# ppp 钩子：拨号成功把 table 100 切到 ppp；断开换回 prohibit
 mkdir -p /etc/ppp/ip-up.d /etc/ppp/ip-down.d
 cat > /etc/ppp/ip-up.d/10-vless-egress <<EOF
 #!/bin/sh
-# \$1=ppp 接口名。把打了标记 ${FW_MARK} 的流量经本接口默认路由出去。
+# \$1=ppp 接口名。先确保断网保护就位，再把 table ${RT_TABLE} 切到本接口。
 IF="\$1"
 [ -n "\$IF" ] || exit 0
+/usr/local/sbin/l2tp-vless-killswitch.sh
 ip route replace default dev "\$IF" table ${RT_TABLE}
-ip rule add fwmark ${FW_MARK} table ${RT_TABLE} 2>/dev/null || true
 if command -v iptables >/dev/null 2>&1; then
   iptables -t mangle -C OUTPUT -o "\$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
   iptables -t mangle -A OUTPUT -o "\$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
@@ -250,18 +377,19 @@ chmod +x /etc/ppp/ip-up.d/10-vless-egress
 
 cat > /etc/ppp/ip-down.d/10-vless-egress <<EOF
 #!/bin/sh
-IF="\$1"
-[ -n "\$IF" ] || exit 0
-ip route del default dev "\$IF" table ${RT_TABLE} 2>/dev/null || true
+# 隧道断开：table ${RT_TABLE} 换回 prohibit，出站直接丢弃（断网保护）
+ip route replace prohibit default table ${RT_TABLE} 2>/dev/null || \
+ip route add prohibit default table ${RT_TABLE} 2>/dev/null || true
 EOF
 chmod +x /etc/ppp/ip-down.d/10-vless-egress
 
-# ---------- 开机自启：保路由 -> xl2tpd -> 自动拨号 ----------
+# 开机自启：保路由 → 断网保护 → xl2tpd → 自动拨号
 if [ "$OS" = "alpine" ]; then
   cat > /etc/local.d/l2tp-vless.start <<EOF
 #!/bin/sh
-# 开机：先保住 L2TP 服务器路由，再自动拨号
+# 开机：先保住 L2TP 服务器路由，上断网保护，再自动拨号
 /usr/local/sbin/l2tp-vless-route.sh
+/usr/local/sbin/l2tp-vless-killswitch.sh
 for i in \$(seq 1 15); do
   [ -e /var/run/xl2tpd/l2tp-control ] && break
   sleep 1
@@ -273,11 +401,12 @@ EOF
 else
   cat > /etc/systemd/system/l2tp-vless-route.service <<'EOF'
 [Unit]
-Description=Keep L2TP server route via original gateway
+Description=Keep L2TP server route via original gateway + killswitch
 Before=xl2tpd.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/l2tp-vless-route.sh
+ExecStart=/usr/local/sbin/l2tp-vless-killswitch.sh
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -297,15 +426,17 @@ EOF
   systemctl enable l2tp-vless-route.service l2tp-vless-dial.service >/dev/null 2>&1 || true
 fi
 
-# ---------- 启动 xl2tpd 并拨号 ----------
+# ---------- 4. 拨号 ----------
+step "[拨号] 正在拨号…"
 /usr/local/sbin/l2tp-vless-route.sh
+/usr/local/sbin/l2tp-vless-killswitch.sh
 modprobe ppp_generic 2>/dev/null || true
 if [ "$OS" = "alpine" ]; then
   rc-update add xl2tpd default >/dev/null 2>&1 || true
-  rc-service xl2tpd restart >/dev/null 2>&1 || rc-service xl2tpd start
+  rc-service xl2tpd restart >/dev/null 2>&1 || rc-service xl2tpd start >/dev/null 2>&1
 else
   systemctl enable xl2tpd >/dev/null 2>&1 || true
-  systemctl restart xl2tpd
+  systemctl restart xl2tpd >/dev/null 2>&1
 fi
 sleep 2
 for i in $(seq 1 10); do
@@ -326,15 +457,15 @@ PPP_IP=""
 if [ -z "$PPP_IF" ]; then
   warn "PPP 接口未建立：请检查 L2TP 服务器/用户名/密码是否正确"
   warn "查看日志：Debian 用 journalctl -u xl2tpd；Alpine 看 /var/log/messages"
-  warn "脚本继续安装 VLESS，L2TP 通之后出口会自动走隧道"
+  warn "脚本继续安装 VLESS（断网保护已生效，出站不会走德国 IP）"
+  warn "L2TP 通之后出口自动走隧道，不用重跑脚本"
 else
   PPP_IP="$(ip -4 -o addr show dev "$PPP_IF" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
   info "隧道已建立：$PPP_IF，IP = ${PPP_IP:-未知}"
 fi
 
-# ---------- 第二阶段输入：VLESS 端口（手动输入）/ 传输方式 / 伪装站 ----------
-echo ""
-echo "---------- 下面配置 VLESS 节点 ----------"
+# ---------- 5. 第二阶段：VLESS 配置 ----------
+step "[2/2] 隧道就绪，下面配置 VLESS 节点"
 ask_port VLESS_PORT "VLESS 端口"
 
 case "$TRANSPORT" in reality|ws) ;; *) TRANSPORT="" ;; esac
@@ -394,40 +525,74 @@ else
   ask_def WS_PATH "WebSocket 路径" "/ws"
   case "$WS_PATH" in /*) ;; *) WS_PATH="/$WS_PATH" ;; esac
 fi
-echo ""
 
-# ---------- 安装 xray ----------
-if [ ! -x /usr/local/bin/xray ]; then
-  case "$(uname -m)" in
-    x86_64)        XA=64 ;;
-    aarch64|arm64) XA=arm64 ;;
-    *) die "不支持的 CPU 架构：$(uname -m)" ;;
-  esac
-  T="$(mktemp -d)"
-  U="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XA}.zip"
-  info "下载 xray…"
-  curl -fsSL --connect-timeout 15 --max-time 180 --retry 3 --retry-delay 3 \
-    -o "$T/xray.zip" "$U" || { rm -rf "$T"; die "xray 下载失败，请检查网络后重试"; }
-  unzip -o -q "$T/xray.zip" -d "$T" || { rm -rf "$T"; die "xray 解压失败"; }
-  install -m 755 "$T/xray" /usr/local/bin/xray
-  rm -rf "$T"
+# ---------- 6. 下载 xray（参考 dajianjiedian：API 路线优先，直链兜底） ----------
+step "[下载] 获取 Xray 内核…"
+case "$(uname -m)" in
+  x86_64|amd64) XARCH="64" ;;
+  aarch64|arm64) XARCH="arm64-v8a" ;;
+  *) die "不支持的 CPU 架构：$(uname -m)" ;;
+esac
+if [ -x "$XRAY_BIN" ] && "$XRAY_BIN" version >/dev/null 2>&1; then
+  info "Xray 已存在，直接用现有的：$($XRAY_BIN version 2>/dev/null | head -1)"
+else
+  DL_DIR=$(pick_dldir) || die "找不到可写的下载目录"
+  _asset="Xray-linux-${XARCH}.zip"
+  if [ -s "$DL_DIR/xray.zip" ] && unzip -t -q "$DL_DIR/xray.zip" >/dev/null 2>&1; then
+    info "安装包已在本地，直接使用（跳过下载）"
+  else
+    rm -f "$DL_DIR/xray.zip"
+    _ok=0
+    info "尝试下载：GitHub API"
+    if gh_api_dl "XTLS/Xray-core" "$_asset" "$DL_DIR/xray.zip"; then
+      _ok=1
+    else
+      warn "API 路线失败，换 github.com 直链试试…"
+      rm -f "$DL_DIR/xray.zip"
+      _ver=$(curl -fsSL --max-time 20 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
+        | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+      for _url in ${_ver:+https://github.com/XTLS/Xray-core/releases/download/v${_ver}/Xray-linux-${XARCH}.zip} \
+                 "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XARCH}.zip"; do
+        [ -z "$_url" ] && continue
+        info "尝试下载：$_url"
+        if curl -fSL --connect-timeout 20 --speed-time 30 --speed-limit 1000 --retry 2 --retry-delay 3 \
+             -o "$DL_DIR/xray.zip" "$_url"; then
+          _ok=1
+          break
+        fi
+        warn "这个地址下载失败，换下一个试试…"
+        rm -f "$DL_DIR/xray.zip"
+      done
+    fi
+    [ "$_ok" -eq 1 ] || die "Xray 下载失败：到 GitHub 的网络不稳定，稍等几分钟后重跑脚本试试"
+  fi
+  unzip -t -q "$DL_DIR/xray.zip" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
+  rm -rf "$DL_DIR/xray-dl" && mkdir -p "$DL_DIR/xray-dl"
+  unzip -o "$DL_DIR/xray.zip" -d "$DL_DIR/xray-dl" xray || die "解压失败"
+  [ -s "$DL_DIR/xray-dl/xray" ] || die "解压后没找到 xray 文件"
+  install -m 0755 "$DL_DIR/xray-dl/xray" "$XRAY_BIN" || die "安装 Xray 失败"
+  "$XRAY_BIN" version >/dev/null 2>&1 || die "装完的 Xray 跑不起来，安装包可能有问题"
+  mark_our_bin "xray"
+  rm -rf "$DL_DIR"
+  info "Xray 安装成功：$($XRAY_BIN version 2>/dev/null | head -1)"
 fi
 
-# ---------- 生成 xray 配置（UUID 自动生成，不用手动输入） ----------
-[ -n "$VLESS_UUID" ] || VLESS_UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
+# ---------- 7. 写 xray 配置（UUID 自动生成；出站打标走 L2TP） ----------
+step "[配置] 写入配置…"
+[ -n "$VLESS_UUID" ] || VLESS_UUID="$(gen_uuid)"
 [ -n "$VLESS_UUID" ] || die "UUID 生成失败"
 if [ "$TRANSPORT" = "reality" ]; then
-  _kp="$(/usr/local/bin/xray x25519)"
+  _kp="$($XRAY_BIN x25519 2>/dev/null)"
   PRIV_KEY="$(printf '%s' "$_kp" | awk '/Private key:/{print $3}')"
   PUB_KEY="$(printf '%s' "$_kp" | awk '/Public key:/{print $3}')"
   [ -n "$PRIV_KEY" ] && [ -n "$PUB_KEY" ] || die "REALITY 密钥生成失败"
-  SHORT_ID="$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  SHORT_ID="$(rand_hex 8)"
   SNI="${REALITY_DEST%%:*}"
 fi
 
-mkdir -p /etc/xray
+mkdir -p "$XRAY_CONF_DIR"
 if [ "$TRANSPORT" = "reality" ]; then
-  cat > /etc/xray/config.json <<EOF
+  cat > "$XRAY_CONF_DIR/config.json" <<EOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
@@ -449,7 +614,8 @@ if [ "$TRANSPORT" = "reality" ]; then
           "privateKey": "${PRIV_KEY}",
           "shortIds": [ "${SHORT_ID}" ]
         }
-      }
+      },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     }
   ],
   "outbounds": [
@@ -462,7 +628,7 @@ if [ "$TRANSPORT" = "reality" ]; then
 }
 EOF
 else
-  cat > /etc/xray/config.json <<EOF
+  cat > "$XRAY_CONF_DIR/config.json" <<EOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
@@ -476,7 +642,8 @@ else
       "streamSettings": {
         "network": "ws",
         "wsSettings": { "path": "${WS_PATH}" }
-      }
+      },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
     }
   ],
   "outbounds": [
@@ -489,57 +656,111 @@ else
 }
 EOF
 fi
-/usr/local/bin/xray -test -config /etc/xray/config.json >/dev/null 2>&1 \
-  || die "xray 配置校验失败"
+"$XRAY_BIN" -test -config "$XRAY_CONF_DIR/config.json" >/dev/null 2>&1 \
+  || die "配置文件校验没通过，请截图发我看看"
+info "配置文件校验通过"
 
-# ---------- xray 服务 ----------
-if [ "$OS" = "alpine" ]; then
-  cat > /etc/init.d/xray <<'EOF'
-#!/sbin/openrc-run
-name="xray"
-description="Xray VLESS (出口经 L2TP)"
-command="/usr/local/bin/xray"
-command_args="run -config /etc/xray/config.json"
-command_background=true
-pidfile="/run/xray.pid"
-depend() { need net; }
-EOF
-  chmod +x /etc/init.d/xray
-  rc-update add xray default >/dev/null 2>&1 || true
-  rc-service xray restart >/dev/null 2>&1 || rc-service xray start
-else
-  cat > /etc/systemd/system/xray.service <<'EOF'
+# ---------- 8. xray 服务 + 硬检查端口 ----------
+step "[服务] 启动 xray…"
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
-Description=Xray VLESS (出口经 L2TP)
+Description=Xray VLESS (出口经 L2TP，断网保护)
 After=network.target
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
-Restart=always
+User=root
+ExecStart=${XRAY_BIN} -config ${XRAY_CONF_DIR}/config.json
+Restart=on-failure
 RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable xray >/dev/null 2>&1 || true
-  systemctl restart xray
+  systemctl enable xray >/dev/null 2>&1
+  systemctl restart xray >/dev/null 2>&1
+  sleep 1
+  if systemctl is-active --quiet xray; then
+    info "xray 已启动，并设为开机自启"
+  else
+    warn "xray 好像没起来，运行 systemctl status xray 看看原因"
+  fi
+elif command -v rc-service >/dev/null 2>&1; then
+  cat > /etc/init.d/xray <<RCEOF
+#!/sbin/openrc-run
+name="xray"
+description="Xray VLESS (出口经 L2TP，断网保护)"
+command="${XRAY_BIN}"
+command_args="-config ${XRAY_CONF_DIR}/config.json"
+command_background="yes"
+pidfile="/run/xray.pid"
+output_log="/var/log/xray.log"
+error_log="/var/log/xray.log"
+retry="SIGTERM/5/SIGKILL/5"
+depend() { need net; after xl2tpd; }
+start_pre() {
+    if [ -f "\$pidfile" ]; then
+        _ppid=\$(cat "\$pidfile" 2>/dev/null)
+        if [ -n "\$_ppid" ] && ! kill -0 "\$_ppid" 2>/dev/null; then
+            rm -f "\$pidfile"
+        fi
+    fi
+    checkpath -f -m 0644 -o root:root "\$output_log"
+}
+RCEOF
+  chmod +x /etc/init.d/xray
+  rc-update add xray default >/dev/null 2>&1
+  rc-service xray zap >/dev/null 2>&1
+  rc-service xray start >/dev/null 2>&1
+  sleep 1
+  if rc-service xray status >/dev/null 2>&1; then
+    info "xray 已启动，并设为开机自启"
+  else
+    warn "xray 好像没起来，运行 rc-service xray status 看看原因"
+  fi
+else
+  warn "没找到 systemd/OpenRC，改用后台方式启动（重启后需手动再跑一次脚本）"
+  pkill -f "${XRAY_BIN} -config ${XRAY_CONF_DIR}/config.json" >/dev/null 2>&1
+  nohup "$XRAY_BIN" -config "$XRAY_CONF_DIR/config.json" >/var/log/xray.log 2>&1 &
+  sleep 1
+  info "xray 已在后台启动"
 fi
-sleep 2
 
-# ---------- 放行 VLESS 端口 ----------
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-  ufw allow "${VLESS_PORT}"/tcp >/dev/null 2>&1 || true
-elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-  firewall-cmd --permanent --add-port="${VLESS_PORT}"/tcp >/dev/null 2>&1 || true
-  firewall-cmd --reload >/dev/null 2>&1 || true
-elif command -v iptables >/dev/null 2>&1; then
-  iptables -C INPUT -p tcp --dport "$VLESS_PORT" -j ACCEPT 2>/dev/null \
-    || iptables -I INPUT -p tcp --dport "$VLESS_PORT" -j ACCEPT 2>/dev/null || true
+# 硬检查：端口必须真的在监听（服务显示已启动不代表真在工作）
+if wait_for_port "$VLESS_PORT" 15; then
+  info "端口 $VLESS_PORT/tcp 已在监听，服务真正跑起来了"
+else
+  die "服务没能监听端口 $VLESS_PORT：节点装坏了。请先运行 systemctl status xray（或 rc-service xray status）看原因，修好再重跑脚本"
 fi
 
-# ---------- 验证与输出 ----------
-DE_IP="$(curl -s --max-time 10 https://ifconfig.me 2>/dev/null \
-  || curl -s --max-time 10 https://api.ipify.org 2>/dev/null || echo "")"
+# ---------- 9. 放行端口 ----------
+step "[网络] 放行端口…"
+echo "$VLESS_PORT tcp" > "$NODE_DIR/fw_info"
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow "$VLESS_PORT"/tcp >/dev/null 2>&1 && info "ufw 已放行 $VLESS_PORT/tcp"
+fi
+if command -v firewall-cmd >/dev/null 2>&1; then
+  firewall-cmd --permanent --add-port="$VLESS_PORT"/tcp >/dev/null 2>&1
+  firewall-cmd --reload >/dev/null 2>&1 && info "firewalld 已放行 $VLESS_PORT/tcp"
+fi
+if command -v iptables >/dev/null 2>&1; then
+  iptables -C INPUT -p tcp --dport "$VLESS_PORT" -j ACCEPT >/dev/null 2>&1 \
+    || iptables -I INPUT -p tcp --dport "$VLESS_PORT" -j ACCEPT >/dev/null 2>&1
+fi
+warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台安全组放行 $VLESS_PORT 端口"
+
+# ---------- 10. 断网保护确认 + 出口验证 ----------
+step "[保护] 检查断网保护…"
+/usr/local/sbin/l2tp-vless-killswitch.sh
+printf "当前 table ${RT_TABLE} 路由：\n"
+ip route show table "$RT_TABLE" 2>/dev/null | sed 's/^/  /'
+if ip route show table "$RT_TABLE" 2>/dev/null | grep -q "dev ppp"; then
+  info "隧道正常，VLESS 出站走 L2TP"
+else
+  warn "隧道未建立：table ${RT_TABLE} 为 prohibit，出站直接丢弃，不会走德国 IP（这就是断网保护）"
+fi
+
+DE_IP="$(get_ip || echo "")"
 [ -n "$DE_IP" ] || DE_IP="<德国VPS公网IP>"
 UK_IP=""
 if [ -n "$PPP_IF" ]; then
@@ -547,25 +768,167 @@ if [ -n "$PPP_IF" ]; then
 fi
 [ -n "$UK_IP" ] || UK_IP="<待 L2TP 拨号成功后自动生效>"
 
+# ---------- 11. 生成链接 + jiedian/xiezai ----------
+step "[完成] 生成你的节点…"
 if [ "$TRANSPORT" = "reality" ]; then
   LINK="vless://${VLESS_UUID}@${DE_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB_KEY}&sid=${SHORT_ID}&type=tcp#uk-egress"
+  PROTO_NAME="VLESS + REALITY + Vision"
 else
   _p="$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')"
   LINK="vless://${VLESS_UUID}@${DE_IP}:${VLESS_PORT}?encryption=none&type=ws&path=${_p}#uk-egress"
+  PROTO_NAME="VLESS + WebSocket"
 fi
-printf '%s\n' "$LINK" > /etc/l2tp-vless/client-link.txt
-chmod 600 /etc/l2tp-vless/client-link.txt
 
-echo ""
-echo "=============================================="
-echo " 安装完成"
-echo "=============================================="
-echo "VLESS 入口（德国 VPS）： ${DE_IP}:${VLESS_PORT}"
-echo "L2TP 隧道 IP：           ${PPP_IP:-未建立}"
-echo "VLESS 出口 IP：          ${UK_IP}"
-echo ""
-echo "客户端链接："
-echo "$LINK"
-echo ""
-echo "链接已保存到 /etc/l2tp-vless/client-link.txt"
-echo "手动验证出口： curl --interface ${PPP_IF:-ppp0} https://ifconfig.me"
+{
+  printf "==============================================\n"
+  printf " 你的节点（复制下面整行，粘贴到客户端导入）\n"
+  printf "==============================================\n"
+  printf "%s\n" "$LINK"
+  printf -- "----------------------------------------------\n"
+  printf "协议: %s\n" "$PROTO_NAME"
+  printf "地址: %s\n" "$DE_IP"
+  printf "端口: %s\n" "$VLESS_PORT"
+  printf "UUID: %s\n" "$VLESS_UUID"
+  if [ "$TRANSPORT" = "reality" ]; then
+    printf "伪装域名: %s\n" "$SNI"
+  else
+    printf "WS 路径: %s\n" "$WS_PATH"
+  fi
+  printf "出口 IP: %s（走英国 L2TP）\n" "$UK_IP"
+  printf "断网保护: L2TP 断开后节点直接断网，不会用德国 IP 出口\n"
+  printf -- "----------------------------------------------\n"
+  printf "以后想看节点，直接输入: jiedian\n"
+  printf "不想要了，输入: xiezai 一键卸载\n"
+  printf "==============================================\n"
+} > "$NODE_DIR/node.txt"
+chmod 600 "$NODE_DIR/node.txt"
+
+cat > /usr/local/bin/jiedian <<'JDEOF'
+#!/bin/sh
+# 输入 jiedian，立刻显示你的节点 + L2TP 实时状态
+if [ -f /etc/l2tp-vless/node.txt ]; then
+  cat /etc/l2tp-vless/node.txt
+else
+  echo "还没安装节点，请先运行一键安装脚本"
+  exit 0
+fi
+printf "\n--- L2TP 隧道实时状态 ---\n"
+if ip -o link show 2>/dev/null | grep -qE 'ppp[0-9]+'; then
+  _pif=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^ppp[0-9]+$' | head -1)
+  _pip=$(ip -4 -o addr show dev "$_pif" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+  printf "隧道接口：%s，隧道 IP：%s\n" "$_pif" "${_pip:-未知}"
+  _uk=$(curl --interface "$_pif" -s --max-time 10 https://ifconfig.me 2>/dev/null || echo "")
+  printf "当前出口 IP：%s\n" "${_uk:-检测失败}"
+else
+  echo "隧道未建立（L2TP 断开时节点断网是正常的，续费重连后自动恢复）"
+fi
+echo "策略路由表（table 100）："
+ip route show table 100 2>/dev/null | sed 's/^/  /'
+JDEOF
+chmod +x /usr/local/bin/jiedian
+info "已安装 jiedian 命令：以后输入 jiedian 就能看节点"
+
+cat > /usr/local/bin/xiezai <<'XZEOF'
+#!/bin/sh
+# 输入 xiezai，一键卸载 vless-l2tp：停服务、删配置、清路由规则、撤防火墙
+echo "正在卸载 vless-l2tp…"
+
+# 停掉 xray
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  systemctl stop xray >/dev/null 2>&1
+  systemctl disable xray >/dev/null 2>&1
+  rm -f /etc/systemd/system/xray.service
+fi
+if command -v rc-service >/dev/null 2>&1; then
+  rc-service xray stop >/dev/null 2>&1
+  rc-update del xray default >/dev/null 2>&1
+  rm -f /etc/init.d/xray
+fi
+[ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
+pkill -x xray >/dev/null 2>&1
+
+# 断开 L2TP，清理拨号相关服务
+if [ -e /var/run/xl2tpd/l2tp-control ]; then
+  echo "d uk" > /var/run/xl2tpd/l2tp-control 2>/dev/null || true
+  sleep 2
+fi
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  systemctl stop xl2tpd >/dev/null 2>&1
+  systemctl disable xl2tpd l2tp-vless-route l2tp-vless-dial >/dev/null 2>&1
+  rm -f /etc/systemd/system/l2tp-vless-route.service /etc/systemd/system/l2tp-vless-dial.service
+  systemctl daemon-reload >/dev/null 2>&1
+fi
+if command -v rc-service >/dev/null 2>&1; then
+  rc-service xl2tpd stop >/dev/null 2>&1
+  rc-update del xl2tpd default >/dev/null 2>&1
+  rm -f /etc/local.d/l2tp-vless.start
+fi
+pkill -x xl2tpd >/dev/null 2>&1
+pkill -x pppd >/dev/null 2>&1
+sleep 1
+
+# 清策略路由表与规则
+ip route flush table 100 2>/dev/null || true
+while ip rule list 2>/dev/null | grep -q "fwmark 0x64"; do
+  ip rule del fwmark 100 table 100 2>/dev/null || break
+done
+# 删 L2TP 服务器主机路由
+if [ -f /etc/l2tp-vless/net.env ]; then
+  . /etc/l2tp-vless/net.env
+  if [ -n "${SERVER:-}" ]; then
+    _sip=$(getent hosts "$SERVER" 2>/dev/null | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $1; exit}')
+    [ -n "$_sip" ] && ip route del "$_sip" 2>/dev/null || true
+  fi
+fi
+
+# 撤销安装时加的防火墙规则（只删我们加过的那条）
+if [ -f /etc/l2tp-vless/fw_info ]; then
+  read -r _fport _fproto < /etc/l2tp-vless/fw_info
+  if [ -n "$_fport" ] && [ -n "$_fproto" ]; then
+    if command -v ufw >/dev/null 2>&1; then
+      ufw delete allow "$_fport"/"$_fproto" >/dev/null 2>&1
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1; then
+      firewall-cmd --permanent --remove-port="$_fport"/"$_fproto" >/dev/null 2>&1
+      firewall-cmd --reload >/dev/null 2>&1
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+      while iptables -C INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1; do
+        iptables -D INPUT -p "$_fproto" --dport "$_fport" -j ACCEPT >/dev/null 2>&1
+      done
+    fi
+    echo "已撤销端口 $_fport/$_fproto 的防火墙放行"
+  fi
+fi
+
+# 只删脚本自己下载的内核（our_bins 里记着），用户本来就有的不碰
+if [ -f /etc/l2tp-vless/our_bins ]; then
+  while read -r _b; do
+    case "$_b" in
+      xray) rm -f /usr/local/bin/xray && echo "已删除脚本安装的 xray" ;;
+    esac
+  done < /etc/l2tp-vless/our_bins
+fi
+
+# 删配置文件与脚本
+rm -rf /usr/local/etc/xray /etc/l2tp-vless
+rm -rf /etc/xl2tpd /etc/ppp/options.l2tp-vless
+rm -f /etc/ppp/chap-secrets
+rm -f /etc/ppp/ip-up.d/10-vless-egress /etc/ppp/ip-down.d/10-vless-egress
+rm -f /usr/local/sbin/l2tp-vless-route.sh /usr/local/sbin/l2tp-vless-killswitch.sh
+rm -f /var/log/xray.log
+rm -f /usr/local/bin/jiedian
+rm -f /usr/local/bin/xiezai
+
+echo "卸载完成：节点、L2TP 配置、路由规则、防火墙规则都已清除干净。"
+XZEOF
+chmod +x /usr/local/bin/xiezai
+info "已安装 xiezai 命令：输入 xiezai 可一键卸载干净"
+
+# ---------- 12. 显示结果 ----------
+printf "\n"
+cat "$NODE_DIR/node.txt"
+printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
+printf "VLESS 入口：${BOLD}%s:%s${NC}（德国 VPS）\n" "$DE_IP" "$VLESS_PORT"
+printf "VLESS 出口：${BOLD}%s${NC}（英国 L2TP）\n" "$UK_IP"
+printf "以后看节点输入 ${BOLD}jiedian${NC}，不想要了输入 ${BOLD}xiezai${NC} 一键卸载。\n"
