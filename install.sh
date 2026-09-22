@@ -804,10 +804,18 @@ if ip route show table "$RT_TABLE" 2>/dev/null | grep -q "dev ppp"; then
 else
   warn "隧道未建立：table ${RT_TABLE} 为 prohibit，出站直接丢弃，不会走德国 IP（这就是断网保护）"
 fi
+PPP_IP6=""
+UK_IP6=""
 if [ -n "$PPP_IF" ]; then
   PPP_IP6="$(ip -6 -o addr show dev "$PPP_IF" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
   if [ -n "$PPP_IP6" ]; then
     info "隧道 IPv6：$PPP_IP6（IPv6 出站同样走 L2TP，受断网保护）"
+    UK_IP6="$(curl -6 --interface "$PPP_IF" -s --max-time 15 https://ifconfig.me 2>/dev/null || echo "")"
+    if [ -n "$UK_IP6" ]; then
+      info "出口 IPv6：$UK_IP6（走英国 L2TP，自动识别）"
+    else
+      warn "隧道有 IPv6 地址但连不通公网，IPv6 出口不可用"
+    fi
   else
     warn "隧道没有分到公网 IPv6：IPv6 出站将被丢弃，不会从德国 IP 漏出去（这就是断网保护）"
   fi
@@ -848,6 +856,11 @@ fi
     printf "WS 路径: %s\n" "$WS_PATH"
   fi
   printf "出口 IP: %s（走英国 L2TP）\n" "$UK_IP"
+  if [ -n "$UK_IP6" ]; then
+    printf "出口 IPv6: %s（走英国 L2TP）\n" "$UK_IP6"
+  else
+    printf "出口 IPv6: 无（已禁用，不会从德国 IP 漏出）\n"
+  fi
   printf "断网保护: L2TP 断开后节点直接断网，不会用德国 IP 出口\n"
   printf -- "----------------------------------------------\n"
   printf "==============================================\n"
