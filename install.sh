@@ -263,6 +263,7 @@ command -v unzip >/dev/null 2>&1 || _missing="$_missing unzip"
 command -v ss >/dev/null 2>&1 || _missing="$_missing iproute2"
 command -v iptables >/dev/null 2>&1 || _missing="$_missing iptables"
 command -v xl2tpd >/dev/null 2>&1 || _missing="$_missing xl2tpd"
+command -v pppd >/dev/null 2>&1 || _missing="$_missing ppp"
 if [ -n "$_missing" ]; then
   printf "正在安装缺失的软件包：%s（最多等几分钟）…\n" "$_missing"
   export DEBIAN_FRONTEND=noninteractive
@@ -274,10 +275,33 @@ if [ -n "$_missing" ]; then
   fi
   unset DEBIAN_FRONTEND
 fi
-for _b in curl unzip ss iptables xl2tpd; do
+for _b in curl unzip ss iptables xl2tpd pppd; do
   command -v "$_b" >/dev/null 2>&1 || die "缺少 $_b，自动安装失败，请手动安装后重试"
 done
 info "系统工具就绪"
+
+# ---------- PPP 内核支持自检（小鸡能不能拨号就看这个） ----------
+# 软件包是装得上的，但 /dev/ppp 得靠内核。容器型小鸡（OpenVZ/LXC）通常没有，
+# 这里自动尝试加载模块、建设备节点，实在不行就直接报错，不让用户白填一堆信息。
+if [ ! -c /dev/ppp ]; then
+  info "没检测到 /dev/ppp，正在尝试自动启用 PPP 内核支持…"
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe ppp_generic 2>/dev/null || true
+    modprobe ppp_async 2>/dev/null || true
+    sleep 1
+  fi
+  [ -c /dev/ppp ] || mknod /dev/ppp c 108 0 2>/dev/null || true
+fi
+if [ ! -c /dev/ppp ]; then
+  die "你的 VPS 不支持 PPP（/dev/ppp 不存在且无法创建）。
+
+这通常是 OpenVZ / LXC 这类容器型小鸡：内核和母鸡共用，
+装不了 PPP 模块，L2TP 拨号跑不起来。
+
+解决办法：换一台 KVM / Xen / VMware 的 VPS（买的时候看虚拟化类型），
+然后重跑这个脚本。"
+fi
+info "PPP 内核支持正常"
 
 # ---------- 3. L2TP 配置 ----------
 step "[拨号] 配置 L2TP…"
