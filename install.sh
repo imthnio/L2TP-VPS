@@ -760,7 +760,7 @@ if [ -n "$PPP_IF" ]; then
 fi
 [ -n "$UK_IP" ] || UK_IP="<待 L2TP 拨号成功后自动生效>"
 
-# ---------- 11. 生成链接 + jiedian/xiezai ----------
+# ---------- 11. 生成链接 + 保存节点信息 ----------
 step "[完成] 生成你的节点…"
 if [ "$TRANSPORT" = "reality" ]; then
   LINK="vless://${VLESS_UUID}@${DE_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB_KEY}&sid=${SHORT_ID}&type=tcp#uk-egress"
