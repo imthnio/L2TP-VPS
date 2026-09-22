@@ -25,9 +25,6 @@ curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 \
 
 UUID 自动生成，不用输入。装完输出 `vless://` 链接。
 
-无终端环境可用环境变量传入：必填 `L2TP_SERVER` `L2TP_USER` `L2TP_PASS` `VLESS_PORT`；
-可选 `VLESS_UUID` `TRANSPORT=reality|ws` `REALITY_DEST` `WS_PATH`。
-
 ## 断网保护（重点）
 
 VLESS 出站包打 fwmark 标记，只查路由表 table 100。table 100 里永远只有一条默认路由：
