@@ -320,6 +320,15 @@ cat > /usr/local/sbin/l2tp-vless-route.sh <<'EOF'
 # 保证 L2TP 服务器 IP 始终走原始网关，防止隧道流量被策略路由吸走导致自环
 [ -f /etc/l2tp-vless/net.env ] || exit 0
 . /etc/l2tp-vless/net.env
+# 网关每次运行时重新探测（DHCP 换网关也不怕），net.env 里存的是兜底值；
+# 探测时跳过 ppp 接口（隧道本身不该成为自己的下一跳）
+_LR="$(ip -4 route show default 2>/dev/null | awk '$5 !~ /^ppp[0-9]*$/ {print; exit}')"
+[ -n "$_LR" ] || _LR="$(ip -4 route show default 2>/dev/null | head -1)"
+if [ -n "$_LR" ]; then
+  _GW="$(printf '%s' "$_LR" | awk '{for(i=1;i<NF;i++) if ($i=="via") print $(i+1)}')"
+  _IF="$(printf '%s' "$_LR" | awk '{for(i=1;i<NF;i++) if ($i=="dev") print $(i+1)}')"
+  [ -n "$_GW" ] && [ -n "$_IF" ] && { GW="$_GW"; IF="$_IF"; }
+fi
 [ -n "$GW" ] && [ -n "$IF" ] && [ -n "$SERVER" ] || exit 0
 SIP="$(getent hosts "$SERVER" 2>/dev/null | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $1; exit}')"
 [ -n "$SIP" ] || exit 0
@@ -328,19 +337,20 @@ EOF
 chmod +x /usr/local/sbin/l2tp-vless-route.sh
 
 # 断网保护脚本：table 100 里永远只有一条默认路由
+_FW_HEX="$(printf '%x' "$FW_MARK")"
 cat > /usr/local/sbin/l2tp-vless-killswitch.sh <<EOF
 #!/bin/sh
 # 断网保护：fwmark ${FW_MARK} 的包只查 table ${RT_TABLE}。
 # 隧道通 → default dev pppX；隧道断 → prohibit default 直接丢弃。
 # L2TP 一断（比如忘记续费），VLESS 出站直接断网，
 # 绝不会落到德国 VPS 的 IP 上。隧道恢复后自动恢复。
-ip rule list 2>/dev/null | grep -q "fwmark 0x64 lookup ${RT_TABLE}" \
+ip rule list 2>/dev/null | grep -q "fwmark 0x${_FW_HEX} lookup ${RT_TABLE}" \
   || ip rule add fwmark ${FW_MARK} table ${RT_TABLE} 2>/dev/null || true
 ip route show table ${RT_TABLE} 2>/dev/null | grep -q "^default" \
   || ip route add prohibit default table ${RT_TABLE} 2>/dev/null || true
 # IPv6 同样处理：不写 -6 的 ip rule / ip route 只管 IPv4。
 # 不加这两行，IPv6 流量会绕过隧道，断网保护也管不住它。
-ip -6 rule list 2>/dev/null | grep -q "fwmark 0x64 lookup ${RT_TABLE}" \
+ip -6 rule list 2>/dev/null | grep -q "fwmark 0x${_FW_HEX} lookup ${RT_TABLE}" \
   || ip -6 rule add fwmark ${FW_MARK} table ${RT_TABLE} 2>/dev/null || true
 ip -6 route show table ${RT_TABLE} 2>/dev/null | grep -q "^default" \
   || ip -6 route add prohibit default table ${RT_TABLE} 2>/dev/null || true
@@ -357,7 +367,6 @@ redial = yes
 redial timeout = 10
 ppp debug = no
 pppoptfile = /etc/ppp/options.l2tp-vless
-require chap = yes
 refuse pap = yes
 length bit = yes
 EOF
@@ -366,7 +375,6 @@ cat > /etc/ppp/options.l2tp-vless <<EOF
 ipcp-accept-local
 ipcp-accept-remote
 refuse-eap
-require-chap
 noccp
 noauth
 nodefaultroute
@@ -374,6 +382,8 @@ nobsdcomp
 nodeflate
 novj
 novjccomp
+lcp-echo-interval 20
+lcp-echo-failure 3
 mtu 1400
 mru 1400
 name ${L2TP_USER}
@@ -391,6 +401,11 @@ IF="\$1"
 [ -n "\$IF" ] || exit 0
 /usr/local/sbin/l2tp-vless-killswitch.sh
 ip route replace default dev "\$IF" table ${RT_TABLE}
+# 策略路由是非对称的（出去走 ppp 接口、反向查主表是另一条路），
+# 严格 rp_filter 会把隧道回包当成 spoof 丢掉，这里放宽到宽松模式
+if command -v sysctl >/dev/null 2>&1; then
+  sysctl -w "net.ipv4.conf.\$IF.rp_filter=2" >/dev/null 2>&1 || true
+fi
 # IPv6：如果隧道分到了公网 IPv6，打标的 IPv6 包也走本接口；
 # 没分到就保持 prohibit——宁可 IPv6 不通，也不让它从 VPS 本机 IPv6 漏出去。
 _HAS_V6=0
@@ -427,6 +442,40 @@ ip -6 route add prohibit default table ${RT_TABLE} 2>/dev/null || true
 EOF
 chmod +x /etc/ppp/ip-down.d/10-vless-egress
 
+# Alpine 专用修复（Debian/Ubuntu 不受影响）：
+# 1) Alpine 的 xl2tpd 包不带 OpenRC 脚本，自己补一个，不然服务起不来、隧道拨不通
+# 2) Alpine 的 /etc/ppp/ip-up、ip-down 是空壳，不会执行 ip-up.d/、ip-down.d/，
+#    补上钩子执行器，不然隧道通了 table 100 也切不过去
+if [ "$OS" = "alpine" ]; then
+  if [ ! -f /etc/init.d/xl2tpd ]; then
+    cat > /etc/init.d/xl2tpd <<'RCEOF'
+#!/sbin/openrc-run
+name="xl2tpd"
+description="Layer 2 Tunnelling Protocol Daemon"
+command="/usr/sbin/xl2tpd"
+command_args="-D -p /run/xl2tpd.pid"
+command_background="yes"
+pidfile="/run/xl2tpd.pid"
+depend() { need net; }
+RCEOF
+    chmod +x /etc/init.d/xl2tpd
+    info "已补上 Alpine 缺失的 xl2tpd 开机服务"
+  fi
+  for _hook in up down; do
+    _hf="/etc/ppp/ip-$_hook"
+    if [ -f "$_hf" ] && ! grep -q "ip-$_hook\.d" "$_hf" 2>/dev/null; then
+      {
+        printf '\n# L2TP-VPS 补的钩子执行器：原文件是空壳，不跑 ip-%s.d\n' "$_hook"
+        printf 'for _hs in /etc/ppp/ip-%s.d/*; do\n' "$_hook"
+        printf '  [ -x "$_hs" ] || continue\n'
+        printf '  "$_hs" "$@"\n'
+        printf 'done\n'
+      } >> "$_hf"
+      info "已补上 /etc/ppp/ip-$_hook 的钩子执行器"
+    fi
+  done
+fi
+
 # 开机自启：保路由 → 断网保护 → xl2tpd → 自动拨号
 if [ "$OS" = "alpine" ]; then
   cat > /etc/local.d/l2tp-vless.start <<EOF
@@ -435,10 +484,10 @@ if [ "$OS" = "alpine" ]; then
 /usr/local/sbin/l2tp-vless-route.sh
 /usr/local/sbin/l2tp-vless-killswitch.sh
 for i in \$(seq 1 15); do
-  [ -e /var/run/xl2tpd/l2tp-control ] && break
+  [ -p /var/run/xl2tpd/l2tp-control ] && break
   sleep 1
 done
-echo "c ${LAC_NAME}" > /var/run/xl2tpd/l2tp-control 2>/dev/null || true
+[ -p /var/run/xl2tpd/l2tp-control ] && echo "c ${LAC_NAME}" > /var/run/xl2tpd/l2tp-control 2>/dev/null || true
 EOF
   chmod +x /etc/local.d/l2tp-vless.start
   rc-update add local default >/dev/null 2>&1 || true
@@ -462,7 +511,7 @@ Requires=xl2tpd.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'for i in \$(seq 1 15); do [ -e /var/run/xl2tpd/l2tp-control ] && break; sleep 1; done; echo "c ${LAC_NAME}" > /var/run/xl2tpd/l2tp-control'
+ExecStart=/bin/sh -c 'for i in \$(seq 1 15); do [ -p /var/run/xl2tpd/l2tp-control ] && break; sleep 1; done; [ -p /var/run/xl2tpd/l2tp-control ] && echo "c ${LAC_NAME}" > /var/run/xl2tpd/l2tp-control || true'
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -484,11 +533,16 @@ else
 fi
 sleep 2
 for i in $(seq 1 10); do
-  [ -e /var/run/xl2tpd/l2tp-control ] && break
+  [ -p /var/run/xl2tpd/l2tp-control ] && break
   sleep 1
 done
-echo "c ${LAC_NAME}" > /var/run/xl2tpd/l2tp-control 2>/dev/null \
-  || warn "拨号命令发送失败，可手动执行：echo 'c ${LAC_NAME}' > /var/run/xl2tpd/l2tp-control"
+# 先判 -p：xl2tpd 没起来时直接重定向会建出一个普通文件，反而挡住以后建 FIFO
+if [ -p /var/run/xl2tpd/l2tp-control ]; then
+  echo "c ${LAC_NAME}" > /var/run/xl2tpd/l2tp-control 2>/dev/null \
+    || warn "拨号命令发送失败，可手动执行：echo 'c ${LAC_NAME}' > /var/run/xl2tpd/l2tp-control"
+else
+  warn "xl2tpd 控制管道不存在（服务可能没起来），拨号命令没发出去"
+fi
 
 info "等待 PPP 接口建立（最多 40 秒）…"
 PPP_IF=""
@@ -638,6 +692,12 @@ if [ "$TRANSPORT" = "reality" ]; then
   cat > "$XRAY_CONF_DIR/config.json" <<EOF
 {
   "log": { "loglevel": "warning" },
+  "dns": { "servers": [ "8.8.8.8", "1.1.1.1" ] },
+  "routing": {
+    "rules": [
+      { "type": "field", "port": 53, "outboundTag": "dns-egress" }
+    ]
+  },
   "inbounds": [
     {
       "port": ${VLESS_PORT},
@@ -664,6 +724,13 @@ if [ "$TRANSPORT" = "reality" ]; then
   "outbounds": [
     {
       "protocol": "freedom",
+      "tag": "direct",
+      "settings": {},
+      "streamSettings": { "sockopt": { "mark": ${FW_MARK} } }
+    },
+    {
+      "protocol": "freedom",
+      "tag": "dns-egress",
       "settings": {},
       "streamSettings": { "sockopt": { "mark": ${FW_MARK} } }
     }
@@ -674,6 +741,12 @@ else
   cat > "$XRAY_CONF_DIR/config.json" <<EOF
 {
   "log": { "loglevel": "warning" },
+  "dns": { "servers": [ "8.8.8.8", "1.1.1.1" ] },
+  "routing": {
+    "rules": [
+      { "type": "field", "port": 53, "outboundTag": "dns-egress" }
+    ]
+  },
   "inbounds": [
     {
       "port": ${VLESS_PORT},
@@ -692,6 +765,13 @@ else
   "outbounds": [
     {
       "protocol": "freedom",
+      "tag": "direct",
+      "settings": {},
+      "streamSettings": { "sockopt": { "mark": ${FW_MARK} } }
+    },
+    {
+      "protocol": "freedom",
+      "tag": "dns-egress",
       "settings": {},
       "streamSettings": { "sockopt": { "mark": ${FW_MARK} } }
     }
@@ -699,6 +779,7 @@ else
 }
 EOF
 fi
+chmod 600 "$XRAY_CONF_DIR/config.json"
 "$XRAY_BIN" -test -config "$XRAY_CONF_DIR/config.json" >/dev/null 2>&1 \
   || die "配置文件校验没通过，请截图发我看看"
 info "配置文件校验通过"
@@ -825,7 +906,7 @@ DE_IP="$(get_ip || echo "")"
 [ -n "$DE_IP" ] || DE_IP="<德国VPS公网IP>"
 UK_IP=""
 if [ -n "$PPP_IF" ]; then
-  UK_IP="$(curl --interface "$PPP_IF" -s --max-time 15 https://ifconfig.me 2>/dev/null || echo "")"
+  UK_IP="$(curl -4 --interface "$PPP_IF" -s --max-time 15 https://ifconfig.me 2>/dev/null || echo "")"
 fi
 [ -n "$UK_IP" ] || UK_IP="<待 L2TP 拨号成功后自动生效>"
 
@@ -868,6 +949,11 @@ fi
 
 # ---------- 12. 显示结果 ----------
 printf "\n"
-printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
+if [ -n "$PPP_IF" ] && ip route show table "$RT_TABLE" 2>/dev/null | grep -q "dev ppp"; then
+  printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
+else
+  printf "\n${YELLOW}${BOLD}VLESS 装好了，但 L2TP 隧道还没通。${NC}先按上面的提示把隧道问题解决，\n"
+  printf "隧道通之后出口自动走英国，不用重跑脚本。\n"
+fi
 printf "VLESS 入口：${BOLD}%s:%s${NC}（德国 VPS）\n" "$DE_IP" "$VLESS_PORT"
 printf "VLESS 出口：${BOLD}%s${NC}（英国 L2TP）\n" "$UK_IP"
