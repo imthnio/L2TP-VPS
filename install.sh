@@ -32,6 +32,7 @@ VLESS_UUID="${VLESS_UUID:-}"
 TRANS_CHOICE="${TRANS_CHOICE:-}"
 TRANSPORT="${TRANSPORT:-}"
 REALITY_DEST="${REALITY_DEST:-}"
+REALITY_CHOICE="${REALITY_CHOICE:-}"
 WS_PATH="${WS_PATH:-}"
 
 if [ -t 0 ]; then TTY=1; else TTY=0; fi
@@ -46,6 +47,7 @@ get_var() {
     TRANS_CHOICE) printf '%s' "$TRANS_CHOICE" ;;
     TRANSPORT)    printf '%s' "$TRANSPORT" ;;
     REALITY_DEST) printf '%s' "$REALITY_DEST" ;;
+    REALITY_CHOICE) printf '%s' "$REALITY_CHOICE" ;;
     WS_PATH)      printf '%s' "$WS_PATH" ;;
   esac
 }
@@ -60,6 +62,7 @@ set_var() {
     TRANS_CHOICE) TRANS_CHOICE="$2" ;;
     TRANSPORT)    TRANSPORT="$2" ;;
     REALITY_DEST) REALITY_DEST="$2" ;;
+    REALITY_CHOICE) REALITY_CHOICE="$2" ;;
     WS_PATH)      WS_PATH="$2" ;;
     *) die "内部错误：未知变量 $1" ;;
   esac
@@ -145,7 +148,43 @@ if [ -z "$TRANSPORT" ]; then
 fi
 
 if [ "$TRANSPORT" = "reality" ]; then
-  ask_def REALITY_DEST "REALITY 目标网站" "www.microsoft.com:443"
+  if [ -z "$REALITY_DEST" ]; then
+    if [ "$TTY" = "1" ]; then
+      echo ""
+      echo "REALITY 目标网站（伪装对象）："
+      echo "  1) www.samsung.com                     2018-2026 零干扰，最稳"
+      echo "  2) www.cisco.com                       2026 年 0% 干扰，TLS 极稳"
+      echo "  3) itunes.apple.com                    2025-2026 全干净"
+      echo "  4) www.python.org                      技术站，小众不扎眼"
+      echo "  5) m.media-amazon.com                  零干扰记录"
+      echo "  6) images-na.ssl-images-amazon.com      图片 CDN，流量普通"
+      echo "  7) download-installer.cdn.mozilla.net  火狐下载站"
+      echo "  8) www.lovelive-anime.jp               日本动画官网，小厂气质"
+      echo "  9) academy.nvidia.com"
+      echo " 10) lol.secure.dyn.riotcdn.net          游戏补丁 CDN"
+      echo " 11) s0.awsstatic.com"
+      echo " 12) www.amd.com                         有 3% 干扰率，只当备胎"
+      ask_def REALITY_CHOICE "请选择 [1-12]" "1"
+      case "$REALITY_CHOICE" in
+        1)  _rd="www.samsung.com" ;;
+        2)  _rd="www.cisco.com" ;;
+        3)  _rd="itunes.apple.com" ;;
+        4)  _rd="www.python.org" ;;
+        5)  _rd="m.media-amazon.com" ;;
+        6)  _rd="images-na.ssl-images-amazon.com" ;;
+        7)  _rd="download-installer.cdn.mozilla.net" ;;
+        8)  _rd="www.lovelive-anime.jp" ;;
+        9)  _rd="academy.nvidia.com" ;;
+        10) _rd="lol.secure.dyn.riotcdn.net" ;;
+        11) _rd="s0.awsstatic.com" ;;
+        12) _rd="www.amd.com" ;;
+        *)  _rd="www.samsung.com" ;;
+      esac
+      REALITY_DEST="${_rd}:443"
+    else
+      REALITY_DEST="www.samsung.com:443"
+    fi
+  fi
 else
   ask_def WS_PATH "WebSocket 路径" "/ws"
   case "$WS_PATH" in /*) ;; *) WS_PATH="/$WS_PATH" ;; esac
