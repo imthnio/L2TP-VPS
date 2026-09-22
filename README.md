@@ -1,4 +1,4 @@
-# vless-l2tp
+# L2TP+VPS
 
 L2TP利用VPS搭建节点一键脚本：出站默认走 L2TP 隧道，出口 IP 是L2TP的出口IP地址。
 
@@ -6,7 +6,7 @@ L2TP利用VPS搭建节点一键脚本：出站默认走 L2TP 隧道，出口 IP 
 
 ```sh
 curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 \
-  https://raw.githubusercontent.com/imthnio/vless-l2tp/main/install.sh | sudo sh
+  https://raw.githubusercontent.com/imthnio/L2TP-VPS/main/install.sh | sudo sh
 ```
 
 ## 安装时会问什么
