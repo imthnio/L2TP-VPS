@@ -11,16 +11,20 @@ curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 \
 
 ## 安装时会问什么
 
+第一阶段（先问，输完就开始装依赖、拨号）：
 - L2TP 服务器地址（IP 或域名）
 - L2TP 用户名
 - L2TP 密码（输入不回显）
-- VLESS 端口（默认 443）
-- VLESS UUID（回车自动生成）
+
+第二阶段（拨号完成后，配置节点）：
+- VLESS 端口（手动输入纯数字，无默认值；输错或端口被占用会提示重输）
 - 传输方式：1) TCP + REALITY（默认，推荐） 2) WebSocket 明文
 - REALITY 目标网站 12 选 1（默认 `www.samsung.com`，另有 cisco / itunes.apple / python.org / amazon 系 / mozilla / lovelive-anime.jp / nvidia / riotcdn / awsstatic / amd 备选）/ WS 路径（默认 `/ws`）
 
-无终端环境可用环境变量传入：必填 `L2TP_SERVER` `L2TP_USER` `L2TP_PASS`；
-可选 `VLESS_PORT` `VLESS_UUID` `TRANSPORT=reality|ws` `REALITY_DEST` `WS_PATH`。
+UUID 自动生成，不用输入。装完输出的 `vless://` 链接里有。
+
+无终端环境可用环境变量传入：必填 `L2TP_SERVER` `L2TP_USER` `L2TP_PASS` `VLESS_PORT`；
+可选 `VLESS_UUID` `TRANSPORT=reality|ws` `REALITY_DEST` `WS_PATH`。
 
 ## 原理
 
