@@ -1,6 +1,8 @@
 # vless-l2tp
 
-德国 VPS 一键脚本：xl2tpd 拨号 L2TP（英国）+ 搭建 VLESS 节点，VLESS 的出站流量经 L2TP 隧道出去，出口 IP 变成 L2TP 分配的英国 IP。
+德国 VPS 一键脚本：xl2tpd 拨号 L2TP（英国）+ 搭建 VLESS 节点。VLESS 的出站默认走 L2TP 隧道，出口 IP 是英国 IP。
+
+节点搭建部分参考 [dajianjiedian](https://github.com/imthnio/dajianjiedian) 的小白风格：彩色分步骤输出、GitHub API 下载、端口硬检查、`jiedian` 查看、`xiezai` 卸载。
 
 ## 一行安装
 
@@ -17,24 +19,30 @@ curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 \
 - L2TP 密码（输入不回显）
 
 第二阶段（拨号完成后，配置节点）：
-- VLESS 端口（手动输入纯数字，无默认值；输错或端口被占用会提示重输）
+- VLESS 端口（手动输入纯数字，无默认值；输错或被占用会提示重输）
 - 传输方式：1) TCP + REALITY（默认，推荐） 2) WebSocket 明文
 - REALITY 目标网站 12 选 1（默认 `www.samsung.com`，另有 cisco / itunes.apple / python.org / amazon 系 / mozilla / lovelive-anime.jp / nvidia / riotcdn / awsstatic / amd 备选）/ WS 路径（默认 `/ws`）
 
-UUID 自动生成，不用输入。装完输出的 `vless://` 链接里有。
+UUID 自动生成，不用输入。装完输出 `vless://` 链接。
 
 无终端环境可用环境变量传入：必填 `L2TP_SERVER` `L2TP_USER` `L2TP_PASS` `VLESS_PORT`；
 可选 `VLESS_UUID` `TRANSPORT=reality|ws` `REALITY_DEST` `WS_PATH`。
 
-## 原理
+## 断网保护（重点）
 
-- xl2tpd 作 L2TP 客户端拨号，拿到 `ppp0` 与英国 IP
-- xray 出站用 `streamSettings.sockopt.mark=100` 给出站包打标记，策略路由 `fwmark 100 → table 100`，表里是 `default dev ppp0`（拨号成功/断开由 `/etc/ppp/ip-up.d` / `ip-down.d` 自动维护）
-- L2TP 服务器本身加了主机路由走原始网关，避免隧道流量被策略路由吸走导致自环
-- `ppp0` 上对 TCP 做 MSS 钳制，防 PMTU 黑洞
-- 开机自动保路由 + 自动拨号；VLESS 端口自动放行（ufw / firewalld / iptables）
+VLESS 出站包打 fwmark 标记，只查路由表 table 100。table 100 里永远只有一条默认路由：
 
-装完输出 `vless://` 链接（也存于 `/etc/l2tp-vless/client-link.txt`），并实测显示出口 IP。
+- 隧道通 → `default dev ppp0`（拨号成功由 `/etc/ppp/ip-up.d` 自动切换）
+- 隧道断 → `prohibit default`（断开由 `/etc/ppp/ip-down.d` 自动换回）
+
+所以 L2TP 一断（比如忘记续费、账号过期），VLESS 出站直接被丢弃——节点断网，**绝不会**落到德国 VPS 的 IP 上。隧道恢复后自动恢复，不用重跑脚本。
+
+整台 VPS 的默认路由不动（不然 L2TP 一断你连 SSH 都上不去）；L2TP 服务器本身有主机路由走原始网关，避免隧道自环；ppp0 上对 TCP 做 MSS 钳制，防 PMTU 黑洞。
+
+## 常用命令
+
+- `jiedian`：显示节点链接 + L2TP 隧道实时状态（隧道 IP、出口 IP、table 100）
+- `xiezai`：一键卸载（停服务、删 L2TP 配置、清路由规则、撤防火墙、删 xray）
 
 ## 注意
 
