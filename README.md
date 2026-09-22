@@ -2,8 +2,6 @@
 
 L2TP利用VPS搭建节点一键脚本：出站默认走 L2TP 隧道，出口 IP 是L2TP的出口IP地址。
 
-节点搭建部分参考 [dajianjiedian](https://github.com/imthnio/dajianjiedian) 的小白风格：彩色分步骤输出、GitHub API 下载、端口硬检查。
-
 ## 一行安装
 
 ```sh
