@@ -10,7 +10,7 @@
 #   4. 装 xray → 写配置 → 启动 → 输出客户端链接
 #
 # 出口：VLESS 出站默认走 L2TP 隧道（fwmark 策略路由）。
-# 断网保护：table 100 里永远只有一条默认路由——
+# 断网保护：table 100 里永远只有一条默认路由（IPv4 和 IPv6 各一条）——
 #   隧道通时是 default dev ppp0，隧道断时是 prohibit default。
 #   L2TP 一断（比如忘记续费），VLESS 出站直接被丢弃，
 #   节点断网，绝不会落到德国 VPS 的 IP 上。
@@ -334,10 +334,16 @@ cat > /usr/local/sbin/l2tp-vless-killswitch.sh <<EOF
 # 隧道通 → default dev pppX；隧道断 → prohibit default 直接丢弃。
 # L2TP 一断（比如忘记续费），VLESS 出站直接断网，
 # 绝不会落到德国 VPS 的 IP 上。隧道恢复后自动恢复。
-ip rule list 2>/dev/null | grep -q "fwmark 0x64 lookup ${RT_TABLE}" \\
+ip rule list 2>/dev/null | grep -q "fwmark 0x64 lookup ${RT_TABLE}" \
   || ip rule add fwmark ${FW_MARK} table ${RT_TABLE} 2>/dev/null || true
-ip route show table ${RT_TABLE} 2>/dev/null | grep -q "^default" \\
+ip route show table ${RT_TABLE} 2>/dev/null | grep -q "^default" \
   || ip route add prohibit default table ${RT_TABLE} 2>/dev/null || true
+# IPv6 同样处理：不写 -6 的 ip rule / ip route 只管 IPv4。
+# 不加这两行，IPv6 流量会绕过隧道，断网保护也管不住它。
+ip -6 rule list 2>/dev/null | grep -q "fwmark 0x64 lookup ${RT_TABLE}" \
+  || ip -6 rule add fwmark ${FW_MARK} table ${RT_TABLE} 2>/dev/null || true
+ip -6 route show table ${RT_TABLE} 2>/dev/null | grep -q "^default" \
+  || ip -6 route add prohibit default table ${RT_TABLE} 2>/dev/null || true
 EOF
 chmod +x /usr/local/sbin/l2tp-vless-killswitch.sh
 
@@ -385,9 +391,27 @@ IF="\$1"
 [ -n "\$IF" ] || exit 0
 /usr/local/sbin/l2tp-vless-killswitch.sh
 ip route replace default dev "\$IF" table ${RT_TABLE}
+# IPv6：如果隧道分到了公网 IPv6，打标的 IPv6 包也走本接口；
+# 没分到就保持 prohibit——宁可 IPv6 不通，也不让它从 VPS 本机 IPv6 漏出去。
+_HAS_V6=0
+for _w in \$(seq 1 10); do
+  if ip -6 addr show dev "\$IF" scope global 2>/dev/null | grep -q "inet6"; then _HAS_V6=1; break; fi
+  sleep 1
+done
+if [ "\$_HAS_V6" = "1" ]; then
+  ip -6 route replace default dev "\$IF" table ${RT_TABLE} 2>/dev/null || true
+else
+  ip -6 route replace prohibit default table ${RT_TABLE} 2>/dev/null || \
+  ip -6 route add prohibit default table ${RT_TABLE} 2>/dev/null || true
+fi
 if command -v iptables >/dev/null 2>&1; then
   iptables -t mangle -C OUTPUT -o "\$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
   iptables -t mangle -A OUTPUT -o "\$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+fi
+# IPv6 的 MSS 钳制（IPv6 路由器不分片，PMTU 黑洞更致命）
+if command -v ip6tables >/dev/null 2>&1; then
+  ip6tables -t mangle -C OUTPUT -o "\$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+  ip6tables -t mangle -A OUTPUT -o "\$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 fi
 EOF
 chmod +x /etc/ppp/ip-up.d/10-vless-egress
@@ -397,6 +421,9 @@ cat > /etc/ppp/ip-down.d/10-vless-egress <<EOF
 # 隧道断开：table ${RT_TABLE} 换回 prohibit，出站直接丢弃（断网保护）
 ip route replace prohibit default table ${RT_TABLE} 2>/dev/null || \
 ip route add prohibit default table ${RT_TABLE} 2>/dev/null || true
+# IPv6 同样换回 prohibit：隧道一断，IPv6 出站也直接丢弃
+ip -6 route replace prohibit default table ${RT_TABLE} 2>/dev/null || \
+ip -6 route add prohibit default table ${RT_TABLE} 2>/dev/null || true
 EOF
 chmod +x /etc/ppp/ip-down.d/10-vless-egress
 
@@ -768,12 +795,22 @@ warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台�
 # ---------- 10. 断网保护确认 + 出口验证 ----------
 step "[保护] 检查断网保护…"
 /usr/local/sbin/l2tp-vless-killswitch.sh
-printf "当前 table ${RT_TABLE} 路由：\n"
+printf "当前 table ${RT_TABLE} 路由（IPv4）：\n"
 ip route show table "$RT_TABLE" 2>/dev/null | sed 's/^/  /'
+printf "当前 table ${RT_TABLE} 路由（IPv6）：\n"
+ip -6 route show table "$RT_TABLE" 2>/dev/null | sed 's/^/  /'
 if ip route show table "$RT_TABLE" 2>/dev/null | grep -q "dev ppp"; then
   info "隧道正常，VLESS 出站走 L2TP"
 else
   warn "隧道未建立：table ${RT_TABLE} 为 prohibit，出站直接丢弃，不会走德国 IP（这就是断网保护）"
+fi
+if [ -n "$PPP_IF" ]; then
+  PPP_IP6="$(ip -6 -o addr show dev "$PPP_IF" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+  if [ -n "$PPP_IP6" ]; then
+    info "隧道 IPv6：$PPP_IP6（IPv6 出站同样走 L2TP，受断网保护）"
+  else
+    warn "隧道没有分到公网 IPv6：IPv6 出站将被丢弃，不会从德国 IP 漏出去（这就是断网保护）"
+  fi
 fi
 
 DE_IP="$(get_ip || echo "")"
