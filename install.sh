@@ -249,7 +249,7 @@ fi
 step "[1/2] 先填 L2TP 账号（输完就开始拨号）"
 ask_req    L2TP_SERVER "L2TP 服务器地址（IP 或域名）"
 ask_req    L2TP_USER   "L2TP 用户名"
-ask_secret L2TP_PASS   "L2TP 密码（control.aa.net.uk 的 L2TP 服务页上分配的那个）"
+ask_secret L2TP_PASS   "L2TP 密码"
 case "$L2TP_USER" in ''|*[!A-Za-z0-9@._+-]*) die "L2TP 用户名只能包含英文字母、数字、@ . _ + -" ;; esac
 _PASS_SINGLE_LINE="$(printf '%s' "$L2TP_PASS" | tr -d '\r\n')"
 [ "$L2TP_PASS" = "$_PASS_SINGLE_LINE" ] || die "L2TP 密码不能包含换行符"
@@ -640,7 +640,12 @@ for i in $(seq 1 30); do
   [ -n "$PPP_IP" ] && break
   sleep 1
 done
-[ -n "$PPP_IP" ] || die "PPP 接口没有 IPv4 地址，停止安装"
+if [ -z "$PPP_IP" ]; then
+  warn "ppp 接口 $PPP_IF 建好了，但 30 秒都没拿到 IPv4。最近的拨号日志："
+  { journalctl --no-pager -n 80 2>/dev/null || tail -n 80 /var/log/syslog 2>/dev/null || true; } \
+    | grep -Ei 'pppd|xl2tpd|chap|ipcp|lcp' | tail -12 || true
+  die "PPP 接口没有 IPv4 地址，停止安装（隧道能建但拿不到 IP，多半是 A&A 那边的旧会话还没释放：等 10 分钟再重跑；还不行就找 A&A 客服）"
+fi
 ip -4 route show table 100 | grep -q "default dev $PPP_IF" || die "PPP 已建立，但全机策略路由未切换到隧道"
 ip -4 route get 1.1.1.1 2>/dev/null | grep -Eq " dev $PPP_IF( |$)" || die "全机 IPv4 默认出口未切换到 PPP，停止安装"
 info "隧道已建立：$PPP_IF，IP = $PPP_IP"
