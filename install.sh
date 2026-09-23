@@ -277,7 +277,8 @@ command -v xl2tpd >/dev/null 2>&1 || _missing="$_missing xl2tpd"
 command -v pppd >/dev/null 2>&1 || _missing="$_missing ppp"
 command -v sha256sum >/dev/null 2>&1 || _missing="$_missing coreutils"
 if [ -n "$_missing" ]; then
-  printf "正在安装缺失的软件包：%s（最多等几分钟）…\n" "$_missing"
+  printf "正在安装缺失的软件包：%s…\n" "$_missing"
+  printf "（刚装完的系统后台可能在自动更新，会等它的锁释放，最多等十几分钟）\n"
   export DEBIAN_FRONTEND=noninteractive
   # 软件包管理器的输出记到日志里：装不上时直接把真实报错打印出来，不让用户盲猜
   _PKG_LOG="/tmp/l2tp-vps-pkg.log"
@@ -285,11 +286,12 @@ if [ -n "$_missing" ]; then
   if [ "$OS" = "alpine" ]; then
     apk add --no-cache $_missing ca-certificates >>"$_PKG_LOG" 2>&1
   else
-    if ! apt-get update -qq >>"$_PKG_LOG" 2>&1; then
+    # DPkg::Lock::Timeout：开机自动更新占着 dpkg 锁时排队等，不直接报错
+    if ! apt-get -o DPkg::Lock::Timeout=600 update -qq >>"$_PKG_LOG" 2>&1; then
       # Ubuntu 旧版本停止支持后官方源 404，先自动修源再试一次
-      _fix_ubuntu_eol_source && apt-get update -qq >>"$_PKG_LOG" 2>&1
+      _fix_ubuntu_eol_source && apt-get -o DPkg::Lock::Timeout=600 update -qq >>"$_PKG_LOG" 2>&1
     fi
-    apt-get install -y -qq $_missing ca-certificates >>"$_PKG_LOG" 2>&1
+    apt-get -o DPkg::Lock::Timeout=600 install -y -qq $_missing ca-certificates >>"$_PKG_LOG" 2>&1
   fi
   unset DEBIAN_FRONTEND
 fi
