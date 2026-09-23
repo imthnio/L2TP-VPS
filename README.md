@@ -9,7 +9,7 @@ L2TP 接入服务器本身的流量，以及从 VPS 原生 IP 进入的 SSH、VL
 在**目标 VPS 的 SSH 终端**运行下面一整行。请先确认旧 VPS 已停止使用同一条 A&A L2TP 连接，并保留 VPS 提供商的网页控制台，以便网络配置异常时恢复。
 
 ```sh
-curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 -o /tmp/l2tp-vps-install.sh https://raw.githubusercontent.com/imthnio/L2TP-VPS/main/install.sh && sudo sh /tmp/l2tp-vps-install.sh
+curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 -o /tmp/l2tp-vps-install.sh https://raw.githubusercontent.com/imthnio/L2TP-VPS/main/install.sh && if [ "$(id -u)" -eq 0 ]; then sh /tmp/l2tp-vps-install.sh; else sudo sh /tmp/l2tp-vps-install.sh; fi
 ```
 
 脚本需要交互输入，因此先下载再运行。不要用 `curl ... | sudo sh`，那样脚本通常读不到你在终端输入的账号和选项。
