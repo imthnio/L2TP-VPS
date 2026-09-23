@@ -396,14 +396,26 @@ chmod 600 /etc/ppp/chap-secrets /etc/ppp/options.l2tp-vless
 mkdir -p /etc/ppp/ip-up.d /etc/ppp/ip-down.d
 cat > /etc/ppp/ip-up.d/10-vless-egress <<'EOF'
 #!/bin/sh
-IF="$1"
+IF="${1:-}"
 [ -n "$IF" ] || exit 0
 /usr/local/sbin/l2tp-vless-killswitch.sh || exit 1
 ip -4 route replace default dev "$IF" metric 100 table 100 || exit 1
-# A&A 的 IPv6 可能只通过前缀委派提供。未确认 PPP 有全局地址时 IPv6 保持阻断。
-if ip -6 addr show dev "$IF" scope global 2>/dev/null | grep -q 'inet6'; then
+# IPv6CP 常比 IPCP 晚几秒才给 PPP 口分配全局地址：轮询等最多 10 秒再下结论。
+# 查一次就判的话，A&A 分了 IPv6 也走不上隧道（IPv6 会被永久阻断）。
+_has_v6=0
+_i=0
+while [ "$_i" -lt 10 ]; do
+  if ip -6 addr show dev "$IF" scope global 2>/dev/null | grep -q 'inet6'; then
+    _has_v6=1
+    break
+  fi
+  _i=$((_i + 1))
+  sleep 1
+done
+if [ "$_has_v6" = 1 ]; then
   ip -6 route replace default dev "$IF" metric 100 table 100 || exit 1
 fi
+# 未确认 PPP 有全局地址时 IPv6 保持阻断，绝不回落到原生出口。
 sysctl -w "net.ipv4.conf.$IF.rp_filter=2" >/dev/null 2>&1 || true
 iptables -t mangle -C OUTPUT -o "$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null ||
   iptables -t mangle -A OUTPUT -o "$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
@@ -598,6 +610,11 @@ AA_IP6=""
 if [ -n "$PPP_IF" ]; then
   PPP_IP6="$(ip -6 -o addr show dev "$PPP_IF" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
   if [ -n "$PPP_IP6" ]; then
+    # 钩子里的轮询也可能错过晚到的 IPv6CP 地址：这里再补一次，保证隧道有 v6 就一定走隧道。
+    if ! ip -6 route show table 100 2>/dev/null | grep -Eq "^default dev $PPP_IF( |$)"; then
+      warn "PPP 口已有 IPv6 但策略路由缺失，补加隧道 IPv6 默认路由"
+      ip -6 route replace default dev "$PPP_IF" metric 100 table 100 || die "补加隧道 IPv6 默认路由失败"
+    fi
     info "隧道 IPv6：$PPP_IP6（IPv6 出站同样走 L2TP，受断网保护）"
     AA_IP6="$(curl -6 -fsS --noproxy '*' --max-time 15 https://ifconfig.me 2>/dev/null || echo "")"
     if [ -n "$AA_IP6" ]; then
@@ -607,6 +624,21 @@ if [ -n "$PPP_IF" ]; then
     fi
   else
     warn "隧道没有分到公网 IPv6：普通 IPv6 出站将被阻断"
+  fi
+fi
+# IPv6 永不静默泄漏：断言 v6 策略规则存在，且 table 100 的 v6 默认路由
+# 只能是走 PPP 隧道或 prohibit（阻断）——绝不能是原生出口。
+if [ -e /proc/net/if_inet6 ]; then
+  ip -6 rule show | grep -Eq '^10000:.*lookup 100' || die "IPv6 策略路由规则缺失：IPv6 可能走原生出口，已停止安装"
+  # table 100 里可能同时有 metric 100 的隧道默认路由和 metric 42700 的禁止路由：
+  # 隧道路由优先检查（metric 小先生效），禁止路由次之，其他一律视为泄漏风险。
+  _v6tbl="$(ip -6 route show table 100 2>/dev/null || true)"
+  if printf '%s\n' "$_v6tbl" | grep -Eq "^default dev $PPP_IF( |$)"; then
+    info "IPv6 默认路由走隧道（table 100），不会泄漏到原生出口"
+  elif printf '%s\n' "$_v6tbl" | grep -Eq '^prohibit default( |$)'; then
+    info "IPv6 已阻断（table 100），不会走原生出口"
+  else
+    die "IPv6 默认路由异常（table 100 无隧道路由也无禁止路由）：为防止泄漏到原生出口，已停止安装"
   fi
 fi
 
