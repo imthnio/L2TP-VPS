@@ -60,6 +60,33 @@ pick_dldir() {
   return 1
 }
 
+# _fix_ubuntu_eol_source：Ubuntu 旧版本停止支持后，官方源下架该版本的索引，
+# apt-get update 会 404 失败。确认是 EOL（官方源上已没有该版本的 Release 文件）
+# 才把软件源切到 old-releases.ubuntu.com；成功切换返回 0，否则返回 1
+_fix_ubuntu_eol_source() {
+  [ -f /etc/os-release ] || return 1
+  grep -qi '^ID=ubuntu' /etc/os-release || return 1
+  _codename=$(grep '^VERSION_CODENAME=' /etc/os-release | cut -d= -f2 | tr -d ' ')
+  [ -n "$_codename" ] || return 1
+  # 官方源上还能拿到该版本的 Release 文件 → 不是 EOL 问题，不动软件源
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 10 -o /dev/null "http://archive.ubuntu.com/ubuntu/dists/${_codename}/Release" 2>/dev/null && return 1
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --timeout=10 -O /dev/null "http://archive.ubuntu.com/ubuntu/dists/${_codename}/Release" 2>/dev/null && return 1
+  else
+    return 1
+  fi
+  warn "检测到 Ubuntu ${_codename} 已停止支持，软件源切换到 old-releases…"
+  sed -i -E 's#https?://(archive|security)\.ubuntu\.com#http://old-releases.ubuntu.com#g' /etc/apt/sources.list 2>/dev/null
+  if [ -d /etc/apt/sources.list.d ]; then
+    for _f in /etc/apt/sources.list.d/*.list; do
+      [ -f "$_f" ] || continue
+      sed -i -E 's#https?://(archive|security)\.ubuntu\.com#http://old-releases.ubuntu.com#g' "$_f" 2>/dev/null
+    done
+  fi
+  return 0
+}
+
 # wait_for_port <端口> <超时秒>：硬检查端口真的在监听
 wait_for_port() {
   _wp="$1"; _wtimeout="${2:-15}"
@@ -255,7 +282,10 @@ if [ -n "$_missing" ]; then
   if [ "$OS" = "alpine" ]; then
     apk add --no-cache $_missing ca-certificates >/dev/null 2>&1
   else
-    apt-get update -qq >/dev/null 2>&1
+    if ! apt-get update -qq >/dev/null 2>&1; then
+      # Ubuntu 旧版本停止支持后官方源 404，先自动修源再试一次
+      _fix_ubuntu_eol_source && apt-get update -qq >/dev/null 2>&1
+    fi
     apt-get install -y -qq $_missing ca-certificates >/dev/null 2>&1
   fi
   unset DEBIAN_FRONTEND
@@ -672,11 +702,32 @@ else
     info "已验证本地 Xray v26.9.9 安装包"
   else
     rm -f "$DL_DIR/xray.zip"
-    curl -fSL --connect-timeout 20 --max-time 300 --retry 2 --retry-delay 3 \
-      -o "$DL_DIR/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/v26.9.9/${_asset}" \
-      || die "Xray v26.9.9 下载失败，请确认 VPS 能访问 GitHub"
-    printf '%s  %s\n' "$XRAY_SHA256" "$DL_DIR/xray.zip" | sha256sum -c - >/dev/null 2>&1 \
-      || die "Xray 安装包 SHA-256 与官方发布文件不一致，已停止安装"
+    # GitHub 直连失败时自动换镜像源逐个试；每个源下载后都用官方 SHA-256 校验，
+    # 镜像被投毒/文件不对都装不上，只能继续换下一个
+    _ok=0
+    for _mirror in "" "https://gh-proxy.com/" "https://ghproxy.net/" "https://ghfast.top/"; do
+      if [ -z "$_mirror" ]; then
+        _dl_url="https://github.com/XTLS/Xray-core/releases/download/v26.9.9/${_asset}"
+        _dl_name="GitHub 直连"
+      else
+        _dl_url="${_mirror}https://github.com/XTLS/Xray-core/releases/download/v26.9.9/${_asset}"
+        _dl_name="镜像 ${_mirror}"
+      fi
+      info "尝试下载（${_dl_name}）…"
+      if curl -fSL --connect-timeout 20 --max-time 300 --speed-time 30 --speed-limit 1000 --retry 1 \
+           -o "$DL_DIR/xray.zip" "$_dl_url" 2>/dev/null; then
+        if printf '%s  %s\n' "$XRAY_SHA256" "$DL_DIR/xray.zip" | sha256sum -c - >/dev/null 2>&1; then
+          info "下载成功，SHA-256 校验通过"
+          _ok=1
+          break
+        fi
+        warn "这个源的文件校验没通过，换下一个试试…"
+      else
+        warn "这个源连不上，换下一个试试…"
+      fi
+      rm -f "$DL_DIR/xray.zip"
+    done
+    [ "$_ok" -eq 1 ] || die "Xray v26.9.9 下载失败：直连和镜像源都连不上。请检查 VPS 网络，或手动把安装包放到 $DL_DIR/xray.zip 后重跑脚本"
   fi
   unzip -t -q "$DL_DIR/xray.zip" >/dev/null 2>&1 || die "下载的安装包已损坏，请重跑脚本重新下载"
   rm -rf "$DL_DIR/xray-dl" && mkdir -p "$DL_DIR/xray-dl"
