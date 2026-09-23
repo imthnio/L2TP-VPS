@@ -248,7 +248,6 @@ fi
 # ---------- 1. 第一阶段：L2TP 账号 ----------
 step "[1/2] 先填 L2TP 账号（输完就开始拨号）"
 ask_req    L2TP_SERVER "L2TP 服务器地址（IP 或域名）"
-info "A&A 的 L2TP 用户名形如 xxx@a.1（这是 L2TP 专用账号，不是控制面板登录名）"
 ask_req    L2TP_USER   "L2TP 用户名"
 ask_secret L2TP_PASS   "L2TP 密码（control.aa.net.uk 的 L2TP 服务页上分配的那个）"
 case "$L2TP_USER" in ''|*[!A-Za-z0-9@._+-]*) die "L2TP 用户名只能包含英文字母、数字、@ . _ + -" ;; esac
