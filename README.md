@@ -27,7 +27,7 @@ curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 -o /tmp/l2tp-vps-install
 
 安装器在策略路由表中保留禁止默认路由。L2TP 接通时增加优先级更高的 PPP 默认路由；隧道断开或 PPP 接口意外消失时，普通出站会被阻断，不会自动回落到 VPS 原生出口。原生 IP 的管理连接回包和到 A&A 接入服务器的流量保留原生路径。
 
-A&A 接入服务器域名会在安装时解析并固定为 IPv4，以便断线后拨号不依赖被保护规则阻断的 DNS。如果 A&A 以后更改该接入点的 IP，需要在原生网页控制台中重新运行安装器来刷新地址。安装器会备份覆盖前的 `/etc/xl2tpd/xl2tpd.conf` 和 `/etc/ppp/chap-secrets` 到 `/etc/l2tp-vless/`。
+A&A 接入服务器域名会在安装时解析并固定为 IPv4，以便断线后拨号不依赖被保护规则阻断的 DNS。如果 A&A 以后更改该接入点的 IP，且旧隧道已经断开，请从 A&A 获取新的接入点 IPv4，在 VPS 提供商的网页控制台中重新运行安装器并直接填写这个 IPv4；断线保护启用时，域名解析也可能被阻断。安装器会备份覆盖前的 `/etc/xl2tpd/xl2tpd.conf` 和 `/etc/ppp/chap-secrets` 到 `/etc/l2tp-vless/`。
 
 安装成功后可以在 VPS 运行：
 

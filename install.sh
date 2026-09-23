@@ -46,14 +46,6 @@ gen_uuid() {
   fi
 }
 
-get_ip() { # 只取 IPv4 公网 IP，多个网站轮着试
-  for _u in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com"; do
-    _ip=$(curl -fsSL --noproxy '*' --max-time 10 -4 "$_u" 2>/dev/null | tr -d ' \r\n')
-    if [ -n "$_ip" ]; then printf "%s" "$_ip"; return 0; fi
-  done
-  return 1
-}
-
 # pick_dldir：选磁盘上的下载目录（/tmp 可能是内存盘）
 pick_dldir() {
   for _cand in /var/tmp "${HOME:-/root}" /tmp; do
@@ -318,8 +310,7 @@ else
 fi
 [ -n "$SERVER_IP" ] || die "无法解析 L2TP 服务器的 IPv4 地址"
 ip -4 route get "$SERVER_IP" >/dev/null 2>&1 || die "L2TP 服务器 IPv4 地址无效或不可达"
-NATIVE_PUBLIC_IP="$(get_ip || true)"
-[ -n "$NATIVE_PUBLIC_IP" ] || NATIVE_PUBLIC_IP="$NATIVE_IP"
+NATIVE_PUBLIC_IP="$NATIVE_IP"
 info "原生网卡：$DEF_IF；L2TP 服务器 IPv4：$SERVER_IP"
 mkdir -p "$NODE_DIR" /usr/local/sbin
 printf 'GW=%s\nIF=%s\nNATIVE_IP=%s\nSERVER_IP=%s\n' "$DEF_GW" "$DEF_IF" "$NATIVE_IP" "$SERVER_IP" > "$NODE_DIR/net.env"
