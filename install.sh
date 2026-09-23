@@ -581,6 +581,24 @@ if [ -z "$PPP_IP" ]; then
     | grep -Ei 'pppd|xl2tpd|chap|ipcp|lcp' | tail -12 || true
   die "PPP 接口没有 IPv4 地址，停止安装（隧道能建但拿不到 IP，多半是 A&A 那边的旧会话还没释放：等 10 分钟再重跑；还不行就找 A&A 客服）"
 fi
+# 隧道路由由 pppd 的拨号钩子（/etc/ppp/ip-up.d）异步写入：钩子要先跑一遍
+# killswitch（十几条 ip 命令，约半秒），而安装脚本在看到 IPv4 地址后立刻检查，
+# 可能抢在钩子前面误判失败。这里轮询等最多 20 秒，彻底等不到再由安装脚本直接补加。
+if ! ip -4 route show table 100 2>/dev/null | grep -q "default dev $PPP_IF"; then
+  _route_ok=0
+  for _i in $(seq 1 20); do
+    sleep 1
+    if ip -4 route show table 100 2>/dev/null | grep -q "default dev $PPP_IF"; then
+      _route_ok=1
+      break
+    fi
+  done
+  if [ "$_route_ok" != 1 ]; then
+    warn "等了 20 秒拨号钩子还没把隧道路由写进 table 100，改为由安装脚本直接补加"
+    warn "（可能只是钩子执行慢；若这台机器的 ppp 钩子不生效，以后 L2TP 重拨断网时重跑一遍一键脚本即可）"
+    ip -4 route replace default dev "$PPP_IF" metric 100 table 100 || die "补加隧道路由失败"
+  fi
+fi
 ip -4 route show table 100 | grep -q "default dev $PPP_IF" || die "PPP 已建立，但全机策略路由未切换到隧道"
 ip -4 route get 1.1.1.1 2>/dev/null | grep -Eq " dev $PPP_IF( |$)" || die "全机 IPv4 默认出口未切换到 PPP，停止安装"
 info "隧道已建立：$PPP_IF，IP = $PPP_IP"
