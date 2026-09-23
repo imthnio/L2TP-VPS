@@ -276,22 +276,34 @@ command -v iptables >/dev/null 2>&1 || _missing="$_missing iptables"
 command -v xl2tpd >/dev/null 2>&1 || _missing="$_missing xl2tpd"
 command -v pppd >/dev/null 2>&1 || _missing="$_missing ppp"
 command -v sha256sum >/dev/null 2>&1 || _missing="$_missing coreutils"
+# _apt_retry：apt 自己重试（锁被占、网络抖动），每轮等锁最多 10 分钟，共 3 轮
+_apt_retry() {
+  _ar=0
+  while [ "$_ar" -lt 3 ]; do
+    _ar=$((_ar + 1))
+    if "$@" >>"$_PKG_LOG" 2>&1; then return 0; fi
+    [ "$_ar" -lt 3 ] && sleep 20
+  done
+  return 1
+}
+
 if [ -n "$_missing" ]; then
   printf "正在安装缺失的软件包：%s…\n" "$_missing"
-  printf "（刚装完的系统后台可能在自动更新，会等它的锁释放，最多等十几分钟）\n"
+  printf "（刚装完的系统后台可能在自动更新，会自动排队等它，失败会自动重试）\n"
   export DEBIAN_FRONTEND=noninteractive
-  # 软件包管理器的输出记到日志里：装不上时直接把真实报错打印出来，不让用户盲猜
+  # 软件包管理器的输出记到日志里：实在装不上时才把报错打印出来
   _PKG_LOG="/tmp/l2tp-vps-pkg.log"
   : > "$_PKG_LOG" 2>/dev/null
   if [ "$OS" = "alpine" ]; then
     apk add --no-cache $_missing ca-certificates >>"$_PKG_LOG" 2>&1
   else
     # DPkg::Lock::Timeout：开机自动更新占着 dpkg 锁时排队等，不直接报错
-    if ! apt-get -o DPkg::Lock::Timeout=600 update -qq >>"$_PKG_LOG" 2>&1; then
-      # Ubuntu 旧版本停止支持后官方源 404，先自动修源再试一次
-      _fix_ubuntu_eol_source && apt-get -o DPkg::Lock::Timeout=600 update -qq >>"$_PKG_LOG" 2>&1
+    if ! _apt_retry apt-get -o DPkg::Lock::Timeout=600 update -qq; then
+      # Ubuntu 旧版本停止支持后官方源 404，修源后再试
+      _fix_ubuntu_eol_source
+      _apt_retry apt-get -o DPkg::Lock::Timeout=600 update -qq
     fi
-    apt-get -o DPkg::Lock::Timeout=600 install -y -qq $_missing ca-certificates >>"$_PKG_LOG" 2>&1
+    _apt_retry apt-get -o DPkg::Lock::Timeout=600 install -y -qq $_missing ca-certificates
   fi
   unset DEBIAN_FRONTEND
 fi
