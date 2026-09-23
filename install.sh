@@ -1069,6 +1069,120 @@ fi
   printf "==============================================\n"
 }
 
+# ---------- 11.5 安装 shanchu 一键删除命令 ----------
+step "[工具] 安装 shanchu 一键删除命令…"
+cat > /usr/local/bin/shanchu <<'SHANCHU_EOF'
+#!/bin/sh
+# shanchu：删除 L2TP-VPS 一键脚本安装的一切（VLESS 节点 + L2TP 拨号 + 策略路由 + 相关文件）
+# 用法：在终端直接运行 shanchu
+trap 'rm -f /usr/local/bin/shanchu' EXIT
+
+echo "正在删除 VLESS 节点和 L2TP 相关的一切…"
+
+# ---------- 1. 停服务 ----------
+echo "[1/6] 停止服务…"
+if command -v systemctl >/dev/null 2>&1; then
+  for _s in xray l2tp-vless-dial l2tp-vless-route l2tp-vless-guard xl2tpd; do
+    systemctl stop "$_s" 2>/dev/null || true
+    systemctl disable "$_s" 2>/dev/null || true
+  done
+fi
+if command -v rc-service >/dev/null 2>&1; then
+  rc-service xray stop 2>/dev/null || true
+  rc-update del xray default 2>/dev/null || true
+  rc-service xl2tpd stop 2>/dev/null || true
+  rc-update del xl2tpd default 2>/dev/null || true
+  rc-service l2tp-vless-guard stop 2>/dev/null || true
+  rc-update del l2tp-vless-guard boot 2>/dev/null || true
+fi
+
+# ---------- 2. 断开 L2TP ----------
+echo "[2/6] 断开 L2TP…"
+if [ -p /var/run/xl2tpd/l2tp-control ]; then
+  echo "d aa" > /var/run/xl2tpd/l2tp-control 2>/dev/null || true
+  sleep 2
+fi
+pkill -x pppd 2>/dev/null || true
+sleep 1
+
+# ---------- 3. 记下 VLESS 端口（删防火墙规则用） ----------
+_VP=""
+if [ -f /etc/l2tp-vless/fw_info ]; then
+  _VP="$(cut -d' ' -f1 /etc/l2tp-vless/fw_info 2>/dev/null)"
+fi
+
+# ---------- 4. 清策略路由和防火墙 ----------
+echo "[3/6] 清理策略路由和防火墙…"
+for _p in 9000 10000; do
+  while ip -4 rule del pref "$_p" 2>/dev/null; do :; done
+  while ip -6 rule del pref "$_p" 2>/dev/null; do :; done
+done
+ip -4 route flush table 100 2>/dev/null || true
+ip -6 route flush table 100 2>/dev/null || true
+# 删加在 ppp 接口上的 MSS 钳制规则
+for _t in iptables ip6tables; do
+  if command -v "$_t" >/dev/null 2>&1; then
+    "$_t" -t mangle -S OUTPUT 2>/dev/null | grep " -o ppp" | while IFS= read -r _r; do
+      _d="$(printf '%s' "$_r" | sed 's/^-A /-D /')"
+      # shellcheck disable=SC2086
+      "$_t" -t mangle $_d 2>/dev/null || true
+    done
+  fi
+done
+# 删放行的 VLESS 端口
+if [ -n "$_VP" ]; then
+  if command -v ufw >/dev/null 2>&1; then
+    ufw delete allow "$_VP"/tcp >/dev/null 2>&1 || true
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --permanent --remove-port="$_VP"/tcp >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -D INPUT -p tcp --dport "$_VP" -j ACCEPT >/dev/null 2>&1 || true
+  fi
+fi
+
+# ---------- 5. 卸载 xl2tpd/ppp ----------
+echo "[4/6] 卸载 xl2tpd/ppp…"
+if command -v apt-get >/dev/null 2>&1; then
+  DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq xl2tpd ppp >/dev/null 2>&1 || true
+elif command -v apk >/dev/null 2>&1; then
+  apk del xl2tpd ppp >/dev/null 2>&1 || true
+fi
+
+# ---------- 6. 删文件（先恢复安装前备份的配置） ----------
+echo "[5/6] 删除配置文件…"
+if [ -f /etc/l2tp-vless/xl2tpd.conf.before-l2tp-vless ]; then
+  mkdir -p /etc/xl2tpd 2>/dev/null || true
+  cp -p /etc/l2tp-vless/xl2tpd.conf.before-l2tp-vless /etc/xl2tpd/xl2tpd.conf 2>/dev/null || true
+else
+  rm -f /etc/xl2tpd/xl2tpd.conf
+fi
+if [ -f /etc/l2tp-vless/chap-secrets.before-l2tp-vless ]; then
+  cp -p /etc/l2tp-vless/chap-secrets.before-l2tp-vless /etc/ppp/chap-secrets 2>/dev/null || true
+  chmod 600 /etc/ppp/chap-secrets 2>/dev/null || true
+else
+  rm -f /etc/ppp/chap-secrets
+fi
+rm -f /etc/ppp/options.l2tp-vless
+rm -f /etc/ppp/ip-up.d/10-vless-egress /etc/ppp/ip-down.d/10-vless-egress
+rm -rf /etc/l2tp-vless
+rm -rf /usr/local/etc/xray
+rm -f /usr/local/bin/xray
+rm -f /usr/local/sbin/l2tp-vless-killswitch.sh /usr/local/sbin/l2tp-vless-route.sh
+rm -f /etc/systemd/system/xray.service /etc/systemd/system/l2tp-vless-guard.service \
+      /etc/systemd/system/l2tp-vless-route.service /etc/systemd/system/l2tp-vless-dial.service
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload 2>/dev/null || true
+fi
+rm -f /etc/init.d/xray /etc/init.d/xl2tpd /etc/init.d/l2tp-vless-guard
+rm -f /etc/local.d/l2tp-vless.start
+
+echo "[6/6] 完成：VLESS 节点、L2TP 拨号、策略路由、相关文件已全部删除。"
+SHANCHU_EOF
+chmod +x /usr/local/bin/shanchu
+
 # ---------- 12. 显示结果 ----------
 step "[自动检查] 安装完成后验证全机出口和断线保护…"
 printf '① VPS 普通流量的公网 IPv4 出口\n'
@@ -1117,3 +1231,4 @@ printf "\n"
 printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
 printf "VLESS 入口：${BOLD}%s:%s${NC}（VPS 原生 IPv4）\n" "$VPS_IP" "$VLESS_PORT"
 printf "全机普通出口：${BOLD}%s${NC}（A&A L2TP）\n" "$CHECK_IP"
+printf "删除：以后想删掉节点和 L2TP 相关的一切，直接运行 ${BOLD}shanchu${NC}\n"
