@@ -248,7 +248,8 @@ fi
 # ---------- 1. 第一阶段：L2TP 账号 ----------
 step "[1/2] 先填 L2TP 账号（输完就开始拨号）"
 ask_req    L2TP_SERVER "L2TP 服务器地址（IP 或域名）"
-ask_req    L2TP_USER   "L2TP 用户名（A&A 的形如 xxx@a.1）"
+info "A&A 的 L2TP 用户名形如 xxx@a.1（这是 L2TP 专用账号，不是控制面板登录名）"
+ask_req    L2TP_USER   "L2TP 用户名"
 ask_secret L2TP_PASS   "L2TP 密码（control.aa.net.uk 的 L2TP 服务页上分配的那个）"
 case "$L2TP_USER" in ''|*[!A-Za-z0-9@._+-]*) die "L2TP 用户名只能包含英文字母、数字、@ . _ + -" ;; esac
 _PASS_SINGLE_LINE="$(printf '%s' "$L2TP_PASS" | tr -d '\r\n')"
@@ -787,8 +788,10 @@ step "[配置] 写入配置…"
 printf '%s\n' "$VLESS_UUID" | LC_ALL=C grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' || die "VLESS_UUID 格式不正确"
 if [ "$TRANSPORT" = "reality" ]; then
   _kp="$($XRAY_BIN x25519 2>/dev/null)"
-  PRIV_KEY="$(printf '%s' "$_kp" | awk '/Private key:/{print $3}')"
-  PUB_KEY="$(printf '%s' "$_kp" | awk '/Public key:/{print $3}')"
+  # xray v26.x 改了 x25519 输出格式：PrivateKey: / Password (PublicKey): / Hash32:
+  # 旧版是 Private key: / Public key:，两种都兼容着解析
+  PRIV_KEY="$(printf '%s\n' "$_kp" | sed -n 's/^PrivateKey: *//p; s/^Private key: *//p' | head -1)"
+  PUB_KEY="$(printf '%s\n' "$_kp" | sed -n 's/^Password (PublicKey): *//p; s/^Public key: *//p' | head -1)"
   [ -n "$PRIV_KEY" ] && [ -n "$PUB_KEY" ] || die "REALITY 密钥生成失败"
   SHORT_ID="$(rand_hex 8)"
   SNI="${REALITY_DEST%%:*}"
