@@ -18,7 +18,7 @@ _dl_ok=""; _cb="$(date +%s)"; for _m in "https://raw.githubusercontent.com/imthn
 
 只问 A&A L2TP 服务器地址、线路用户名和密码。
 
-脚本在成功拨号、验证普通 IPv4 出口走 A&A 后显示结果。目标 VPS 需要独立公网 IPv4、PPP 内核支持，以及运行中的 systemd（Debian/Ubuntu）或 OpenRC（Alpine）。节点需要自己另外搭建。
+脚本在成功拨号、验证普通 IPv4 出口走 A&A 后显示结果。目标 VPS 需要独立公网 IPv4、PPP 内核支持，以及运行中的 systemd（Debian/Ubuntu）或 OpenRC（Alpine）。
 
 ## 删除
 
