@@ -279,14 +279,17 @@ command -v sha256sum >/dev/null 2>&1 || _missing="$_missing coreutils"
 if [ -n "$_missing" ]; then
   printf "正在安装缺失的软件包：%s（最多等几分钟）…\n" "$_missing"
   export DEBIAN_FRONTEND=noninteractive
+  # 软件包管理器的输出记到日志里：装不上时直接把真实报错打印出来，不让用户盲猜
+  _PKG_LOG="/tmp/l2tp-vps-pkg.log"
+  : > "$_PKG_LOG" 2>/dev/null
   if [ "$OS" = "alpine" ]; then
-    apk add --no-cache $_missing ca-certificates >/dev/null 2>&1
+    apk add --no-cache $_missing ca-certificates >>"$_PKG_LOG" 2>&1
   else
-    if ! apt-get update -qq >/dev/null 2>&1; then
+    if ! apt-get update -qq >>"$_PKG_LOG" 2>&1; then
       # Ubuntu 旧版本停止支持后官方源 404，先自动修源再试一次
-      _fix_ubuntu_eol_source && apt-get update -qq >/dev/null 2>&1
+      _fix_ubuntu_eol_source && apt-get update -qq >>"$_PKG_LOG" 2>&1
     fi
-    apt-get install -y -qq $_missing ca-certificates >/dev/null 2>&1
+    apt-get install -y -qq $_missing ca-certificates >>"$_PKG_LOG" 2>&1
   fi
   unset DEBIAN_FRONTEND
 fi
@@ -301,7 +304,10 @@ for _b in curl unzip ss iptables xl2tpd pppd sha256sum; do
 如果这台机器正在走 A&A 隧道上网，多半是隧道不通——先让隧道通了再重跑脚本。
 这时候手动 apt-get install 也一样装不上，不是少敲了命令。"
     fi
-    die "缺少 $_b，自动安装失败，请手动安装后重试"
+    _PKG_TAIL="$(tail -6 /tmp/l2tp-vps-pkg.log 2>/dev/null)"
+    die "缺少 $_b，自动安装失败。软件源报错如下：
+${_PKG_TAIL:-（无日志输出）}
+把上面几行截图发出来，我看下怎么修。"
   fi
 done
 info "系统工具就绪"
