@@ -291,7 +291,18 @@ if [ -n "$_missing" ]; then
   unset DEBIAN_FRONTEND
 fi
 for _b in curl unzip ss iptables xl2tpd pppd sha256sum; do
-  command -v "$_b" >/dev/null 2>&1 || die "缺少 $_b，自动安装失败，请手动安装后重试"
+  if ! command -v "$_b" >/dev/null 2>&1; then
+    # 装不上多半是压根没网（软件源都连不上），先测一下再报错，
+    # 免得让人去手动 apt-get（没网时手动也一样装不上）
+    if ! curl -fsSL --max-time 10 -o /dev/null "http://archive.ubuntu.com/ubuntu/" 2>/dev/null \
+       && ! curl -kfsSL --max-time 10 -o /dev/null "https://1.1.1.1" 2>/dev/null; then
+      die "软件包 $_b 安装失败：VPS 当前连不上软件源（没网）。
+
+如果这台机器正在走 A&A 隧道上网，多半是隧道不通——先让隧道通了再重跑脚本。
+这时候手动 apt-get install 也一样装不上，不是少敲了命令。"
+    fi
+    die "缺少 $_b，自动安装失败，请手动安装后重试"
+  fi
 done
 info "系统工具就绪"
 
