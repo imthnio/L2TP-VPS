@@ -615,7 +615,14 @@ PPP_IP=""
 if [ -z "$PPP_IF" ]; then
   die "L2TP 未连接。请确认旧 VPS 已停止自动重连，并检查 A&A 的服务器、线路账号和密码；此时普通出站已被阻断。"
 fi
-PPP_IP="$(ip -4 -o addr show dev "$PPP_IF" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+# ppp 接口出现不等于 IPCP 已完成：CHAP 认证和 IP 分配还要几秒，这里轮询等 IP，
+# 否则接口刚出来就查一次会误判失败
+info "等待 PPP 分配 IPv4 地址（最多 30 秒）…"
+for i in $(seq 1 30); do
+  PPP_IP="$(ip -4 -o addr show dev "$PPP_IF" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+  [ -n "$PPP_IP" ] && break
+  sleep 1
+done
 [ -n "$PPP_IP" ] || die "PPP 接口没有 IPv4 地址，停止安装"
 ip -4 route show table 100 | grep -q "default dev $PPP_IF" || die "PPP 已建立，但全机策略路由未切换到隧道"
 ip -4 route get 1.1.1.1 2>/dev/null | grep -Eq " dev $PPP_IF( |$)" || die "全机 IPv4 默认出口未切换到 PPP，停止安装"
