@@ -1,8 +1,8 @@
 # L2TP+VPS
 
-在 Debian、Ubuntu 或 Alpine VPS 上连接 A&A L2TP，并建立 VLESS 节点。安装完成后，**这台 VPS 的普通 IPv4 出站流量**（例如 `curl`、软件更新和节点转发）走 A&A 的出口 IP。IPv6 只有在 L2TP 隧道获得可用的公网 IPv6 时才走隧道；否则普通 IPv6 出站被阻断。
+在 Debian、Ubuntu 或 Alpine VPS 上连接 A&A L2TP，让整台 VPS 的普通出站流量走隧道。安装完成后，**这台 VPS 的普通 IPv4 出站流量**（例如 `curl`、软件更新）走 A&A 的出口 IP。IPv6 只有在 L2TP 隧道获得可用的公网 IPv6 时才走隧道；否则普通 IPv6 出站被阻断。
 
-L2TP 接入服务器本身的流量，以及从 VPS 原生 IP 进入的 SSH、VLESS 等连接的回包，必须继续使用 VPS 原生线路。这是保持隧道和管理入口可用的必要例外。因此不能把“所有网络包”理解为连这些包也改走 A&A。
+L2TP 接入服务器本身的流量，以及从 VPS 原生 IP 进入的 SSH 等连接的回包，必须继续使用 VPS 原生线路。这是保持隧道和管理入口可用的必要例外。因此不能把“所有网络包”理解为连这些包也改走 A&A。
 
 ## 一行安装
 
@@ -16,12 +16,13 @@ _dl_ok=""; _cb="$(date +%s)"; for _m in "https://raw.githubusercontent.com/imthn
 
 ## 安装时输入
 
-1. A&A L2TP 服务器地址、线路用户名和密码。
-2. VLESS 端口（1–65535，且未被占用）。
-3. 传输方式：TCP + REALITY（默认）或 WebSocket。
-4. 如果选择 REALITY，选择目标网站。
+只问 A&A L2TP 服务器地址、线路用户名和密码。
 
-脚本自动生成 UUID，并在成功拨号、验证普通 IPv4 出口后输出 `vless://` 链接。目标 VPS 需要独立公网 IPv4、PPP 内核支持，以及运行中的 systemd（Debian/Ubuntu）或 OpenRC（Alpine）。云平台安全组仍需放行所选 TCP 端口。
+脚本在成功拨号、验证普通 IPv4 出口走 A&A 后显示结果。目标 VPS 需要独立公网 IPv4、PPP 内核支持，以及运行中的 systemd（Debian/Ubuntu）或 OpenRC（Alpine）。节点需要自己另外搭建。
+
+## 删除
+
+在 VPS 上运行 `shanchu`，删除脚本安装的一切（L2TP 拨号、策略路由、相关文件和软件包）。
 
 ## 路由与断线保护
 
