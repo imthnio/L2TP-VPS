@@ -888,16 +888,9 @@ warn "如果是云服务器（阿里云/腾讯云/AWS 等），还去控制台�
 
 # ---------- 10. 断网保护确认 + 出口验证 ----------
 step "[保护] 检查断网保护…"
-/usr/local/sbin/l2tp-vless-killswitch.sh
-printf "当前 table ${RT_TABLE} 路由（IPv4）：\n"
-ip route show table "$RT_TABLE" 2>/dev/null | sed 's/^/  /'
-printf "当前 table ${RT_TABLE} 路由（IPv6）：\n"
-ip -6 route show table "$RT_TABLE" 2>/dev/null | sed 's/^/  /'
-if ip route show table "$RT_TABLE" 2>/dev/null | grep -q "dev ppp"; then
-  info "隧道正常，VLESS 出站走 L2TP"
-else
-  warn "隧道未建立：普通出站被阻断，不会回落到 VPS 原生出口"
-fi
+/usr/local/sbin/l2tp-vless-killswitch.sh || die "断网保护规则安装失败"
+ip -4 route show table "$RT_TABLE" 2>/dev/null | grep -Eq "^default dev $PPP_IF( |$)" \
+  || die "隧道默认路由已丢失，停止安装"
 PPP_IP6=""
 AA_IP6=""
 if [ -n "$PPP_IF" ]; then
@@ -962,7 +955,50 @@ fi
 }
 
 # ---------- 12. 显示结果 ----------
+step "[自动检查] 安装完成后验证全机出口和断线保护…"
+printf '① VPS 普通流量的公网 IPv4 出口\n'
+printf '   执行：curl -4 --noproxy "*" https://ifconfig.me\n'
+CHECK_IP="$(curl -4 -fsS --noproxy '*' --max-time 15 https://ifconfig.me 2>/dev/null || true)"
+[ -n "$CHECK_IP" ] || die "公网 IPv4 出口检查失败；不能确认流量已走 A&A"
+printf '%s\n' "$CHECK_IP" | awk -F. 'NF != 4 { exit 1 } { for (i=1; i<=4; i++) if ($i !~ /^[0-9]+$/ || $i > 255) exit 1 }' \
+  || die "公网 IPv4 出口检查返回了无效地址"
+printf '   结果：%s（应与你的 A&A 出口 IPv4 一致）\n' "$CHECK_IP"
+[ "$CHECK_IP" != "$VPS_IP" ] || die "出口仍是 VPS 原生 IPv4，安装未达到目标"
+
+printf '\n② A&A 路由表（数字 %s）\n' "$RT_TABLE"
+printf '   执行：ip -4 route show table %s\n' "$RT_TABLE"
+CHECK_ROUTES="$(ip -4 route show table "$RT_TABLE" 2>/dev/null)" || die "无法读取 A&A 路由表"
+[ -n "$CHECK_ROUTES" ] || die "A&A 路由表为空"
+printf '%s\n' "$CHECK_ROUTES" | while IFS= read -r _route; do
+  case "$_route" in
+    "default dev $PPP_IF"*) printf '   A&A 隧道默认路由：%s\n' "$_route" ;;
+    'prohibit default'*) printf '   断线保护（隧道断开时阻止回落）：%s\n' "$_route" ;;
+    "$SERVER_IP "*|"$SERVER_IP/32 "*) printf '   A&A 接入服务器使用原生线路：%s\n' "$_route" ;;
+    *) printf '   其他路由：%s\n' "$_route" ;;
+  esac
+done
+printf '%s\n' "$CHECK_ROUTES" | grep -Eq "^default dev $PPP_IF( |$)" || die "A&A 隧道默认路由缺失"
+printf '%s\n' "$CHECK_ROUTES" | grep -q '^prohibit default' || die "断线保护的禁止路由缺失"
+
+printf '\n③ 出站策略规则（数字越小越优先）\n'
+printf '   执行：ip -4 rule show\n'
+CHECK_RULES="$(ip -4 rule show 2>/dev/null)" || die "无法读取出站策略规则"
+printf '%s\n' "$CHECK_RULES" | while IFS= read -r _rule; do
+  case "$_rule" in
+    '0:'*) printf '   系统本机地址规则：%s\n' "$_rule" ;;
+    '9000:'*) printf '   原生 IP 管理连接的回包走原生线路：%s\n' "$_rule" ;;
+    '10000:'*) printf '   普通出站优先查 A&A 路由表：%s\n' "$_rule" ;;
+    '32766:'*) printf '   系统原生主路由表：%s\n' "$_rule" ;;
+    '32767:'*) printf '   系统默认规则：%s\n' "$_rule" ;;
+    *) printf '   其他规则：%s\n' "$_rule" ;;
+  esac
+done
+printf '%s\n' "$CHECK_RULES" | grep -Eq '^9000:.*lookup main' || die "原生管理回包规则缺失"
+printf '%s\n' "$CHECK_RULES" | grep -Eq "^10000:.*lookup $RT_TABLE" || die "全机 A&A 出站规则缺失"
+ip -4 route get 1.1.1.1 2>/dev/null | grep -Eq " dev $PPP_IF( |$)" || die "普通 IPv4 目的地没有走 A&A 隧道"
+info "三项自动检查通过；普通 IPv4 出站使用 A&A 隧道"
+
 printf "\n"
 printf "\n${GREEN}${BOLD}安装完成！${NC}把上面那行链接复制到客户端就能用了。\n"
 printf "VLESS 入口：${BOLD}%s:%s${NC}（VPS 原生 IPv4）\n" "$VPS_IP" "$VLESS_PORT"
-printf "全机普通出口：${BOLD}%s${NC}（A&A L2TP）\n" "$AA_IP"
+printf "全机普通出口：${BOLD}%s${NC}（A&A L2TP）\n" "$CHECK_IP"
