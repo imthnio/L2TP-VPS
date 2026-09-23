@@ -248,8 +248,8 @@ fi
 # ---------- 1. 第一阶段：L2TP 账号 ----------
 step "[1/2] 先填 L2TP 账号（输完就开始拨号）"
 ask_req    L2TP_SERVER "L2TP 服务器地址（IP 或域名）"
-ask_req    L2TP_USER   "L2TP 用户名"
-ask_secret L2TP_PASS   "L2TP 密码"
+ask_req    L2TP_USER   "L2TP 用户名（A&A 的形如 xxx@a.1）"
+ask_secret L2TP_PASS   "L2TP 密码（control.aa.net.uk 的 L2TP 服务页上分配的那个）"
 case "$L2TP_USER" in ''|*[!A-Za-z0-9@._+-]*) die "L2TP 用户名只能包含英文字母、数字、@ . _ + -" ;; esac
 _PASS_SINGLE_LINE="$(printf '%s' "$L2TP_PASS" | tr -d '\r\n')"
 [ "$L2TP_PASS" = "$_PASS_SINGLE_LINE" ] || die "L2TP 密码不能包含换行符"
@@ -620,6 +620,23 @@ PPP_IP="$(ip -4 -o addr show dev "$PPP_IF" 2>/dev/null | awk '{print $4}' | cut 
 ip -4 route show table 100 | grep -q "default dev $PPP_IF" || die "PPP 已建立，但全机策略路由未切换到隧道"
 ip -4 route get 1.1.1.1 2>/dev/null | grep -Eq " dev $PPP_IF( |$)" || die "全机 IPv4 默认出口未切换到 PPP，停止安装"
 info "隧道已建立：$PPP_IF，IP = $PPP_IP"
+# 隧道健康检查：PPP 拿到 IP 不代表数据能走。A&A 账号侧出问题（L2TP 服务没开通/
+# 被暂停、密码不对）时，LNS 会让 PPP 建好却不转发任何流量；这时继续装只会卡在
+# 下载那步，提前报清楚。
+info "检查隧道数据是否通畅…"
+_TUN_OK=0
+for _try in 1 2; do
+  if curl -4 -sS -m 20 -o /dev/null "https://github.com" 2>/dev/null \
+     || curl -4 -sk -m 15 -o /dev/null "https://1.1.1.1" 2>/dev/null; then
+    _TUN_OK=1
+    break
+  fi
+  [ "$_try" = "1" ] && sleep 5
+done
+if [ "$_TUN_OK" -ne 1 ]; then
+  die "隧道已连上（IP $PPP_IP），但数据走不过去：A&A 那边没有转发流量。这通常是 A&A 账号侧的问题——L2TP 服务没开通/被暂停，或密码不对。请登录 control.aa.net.uk 检查 L2TP 服务页（用户名形如 xxx@a.1，密码用服务页上分配的那个），或联系 A&A 客服；解决后重跑脚本即可"
+fi
+info "隧道数据通畅"
 # ---------- 5. 第二阶段：VLESS 配置 ----------
 step "[2/2] 隧道就绪，下面配置 VLESS 节点"
 ask_port VLESS_PORT "VLESS 端口"
