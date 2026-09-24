@@ -23,3 +23,9 @@ _dl_ok=""; _cb="$(date +%s)"; for _m in "https://raw.githubusercontent.com/imthn
 ## 删除
 
 在 VPS 上运行 `shanchu`，删除脚本安装的一切（L2TP 拨号、策略路由、相关文件和软件包）。
+
+## 赞赏支持
+如果这个脚本帮到了你，欢迎请我喝杯咖啡 ☕  
+微信扫一扫下方赞赏码即可：
+
+![赞赏码](./appreciate.png)
