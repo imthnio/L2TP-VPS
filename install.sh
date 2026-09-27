@@ -1,7 +1,8 @@
 #!/bin/sh
 # L2TP-VPS installer; generated with tools/build.py. Download this file, then run sh.
 set -eu
-VERSION=2.0.4
+trap '' HUP
+VERSION=2.0.5
 case "${1:-}" in --version) echo "$VERSION"; exit 0;; esac
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -172,6 +173,7 @@ cat > "$RUNTIME.new" <<'L2TP_RUNTIME_EOF'
 #!/bin/sh
 # L2TP-VPS runtime. Only this project's table, chains, service and peer are owned.
 set -eu
+trap '' HUP
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 STATE=/etc/l2tp-vless
@@ -250,6 +252,22 @@ copy_link_routes() {
     copy_dev_prefixes -6
   fi
 }
+install_native_fallback() {
+  # A usable route must exist before the output hook runs. Otherwise an SSH
+  # reply is rejected by prohibit and the session dies before it can be
+  # marked and sent back out the native NIC. Metric 40000 loses to the
+  # tunnel route at metric 100. The output filter still rejects new
+  # connections that take this fallback.
+  family=$1
+  route=$(ip "$family" route show default table main 2>/dev/null | awk -v nic="$NATIVE_IF" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==nic) {print; exit}}')
+  [ -n "$route" ] || return 0
+  gateway=$(printf '%s\n' "$route" | awk '{for(i=1;i<NF;i++) if($i=="via") {print $(i+1); exit}}')
+  if [ -n "$gateway" ]; then
+    ip "$family" route replace default via "$gateway" dev "$NATIVE_IF" onlink metric 40000 table "$TABLE"
+  else
+    ip "$family" route replace default dev "$NATIVE_IF" metric 40000 table "$TABLE"
+  fi
+}
 guard() {
   # nft submits the whole replacement as one atomic transaction.
   # Install the reply mark before removing the old "from native address" rule,
@@ -261,6 +279,7 @@ guard() {
   render_firewall | nft -f -
   copy_link_routes
   ip -4 route replace prohibit default metric 42700 table "$TABLE"
+  install_native_fallback -4
   rule -4 8900 "uidrange $FETCH_UID-$FETCH_UID lookup main" uidrange "$FETCH_UID-$FETCH_UID" table main
   # 8904 is after the maintenance UID rule and before any leftover "from native address" rule.
   rule -4 8904 "fwmark $TUNMARK lookup $TABLE" fwmark "$TUNMARK" table "$TABLE"
@@ -269,6 +288,7 @@ guard() {
   rule -4 8930 "blackhole" blackhole
   if ipv6_on; then
     ip -6 route replace prohibit default metric 42700 table "$TABLE"
+    install_native_fallback -6
     rule -6 8900 "uidrange $FETCH_UID-$FETCH_UID lookup main" uidrange "$FETCH_UID-$FETCH_UID" table main
     rule -6 8904 "fwmark $TUNMARK lookup $TABLE" fwmark "$TUNMARK" table "$TABLE"
     rule -6 8905 "fwmark $MARK lookup main" fwmark "$MARK" table main
@@ -289,6 +309,7 @@ endpoint_route() {
   else
     ip -4 route replace "$ENDPOINT/32" dev "$NATIVE_IF" table "$TABLE"
   fi
+  install_native_fallback -4
 }
 peer_up() {
   # Both the independent interface name AND pppd ipparam must match.
@@ -482,6 +503,8 @@ remove_routes() {
     # shellcheck disable=SC2086
     ip -4 route del $line table "$TABLE" 2>/dev/null || true
   done
+  ip -4 route del default metric 40000 table "$TABLE" 2>/dev/null || true
+  ip -6 route del default metric 40000 table "$TABLE" 2>/dev/null || true
   ip -4 route del prohibit default metric 42700 table "$TABLE" 2>/dev/null || true
   ip -6 route del prohibit default metric 42700 table "$TABLE" 2>/dev/null || true
   ip -4 route del "$ENDPOINT/32" table "$TABLE" 2>/dev/null || true
