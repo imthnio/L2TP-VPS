@@ -44,7 +44,7 @@ INIT=systemd
         if okay and result.returncode: raise AssertionError(result.stderr)
         if not okay and not result.returncode: raise AssertionError('Unexpected native egress: '+result.stdout)
         return result.stdout.strip()
-    http=d/'http.py'
+    http=d/'test_server.py'
     http.write_text('''import http.server,sys,socket
 class Handler(http.server.BaseHTTPRequestHandler):
  def do_GET(self):
@@ -79,6 +79,9 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         serve(client,'0.0.0.0',18081)
         serve(client,'::',18083)
         time.sleep(.4)
+        for process in processes:
+            if process.poll() is not None:
+                raise AssertionError(process.stderr.read().decode())
         assert curl(client,'http://203.0.113.1:18080')=='192.0.2.10'
         runtime('guard; endpoint_route')
         # The actual nft batch has now been parsed and installed by the kernel.
