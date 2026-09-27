@@ -33,6 +33,7 @@ table inet l2tp_vps {
     ip6 hoplimit 255 icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } return
     udp sport 68 udp dport 67 return
     udp sport 546 udp dport 547 return
+    meta skuid $FETCH_UID return
     ct direction original meta mark set $TUNMARK
   }
   chain l2tp_nat {
