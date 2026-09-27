@@ -192,7 +192,7 @@ add table inet l2tp_vps
 flush table inet l2tp_vps
 table inet l2tp_vps {
   chain l2tp_route {
-    type route hook output priority mangle; policy accept;
+    type route hook output priority 300; policy accept;
     ct direction reply meta mark set $MARK
   }
   chain l2tp_nat {
