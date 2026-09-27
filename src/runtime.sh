@@ -6,15 +6,17 @@ export PATH
 STATE=/etc/l2tp-vless
 TABLE=24680
 MARK=0x24680
+TUNMARK=0x24681
 PEER=l2tp-aa
 TAG=l2tp-vps
 fatal() { printf '%s\n' "$*" >&2; exit 1; }
 load() { [ -f "$STATE/v2-owned" ] || fatal '尚未安装新版'; . "$STATE/net.env"; }
 ipv6_on() { [ -e /proc/net/if_inet6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" != 1 ]; }
 render_firewall() {
-  # Replies to connections that arrived here go back out the native NIC.
-  # Every other packet, including one bound to the native address, is routed
-  # into the tunnel and rewritten to the tunnel address.
+  # A reply to a connection that arrived here is marked so a second lookup
+  # sends it back out the native NIC. Every locally started packet is marked
+  # with a different value so that second lookup enters the tunnel, then the
+  # source is rewritten to the tunnel address.
   cat <<EOF
 add table inet l2tp_vps
 flush table inet l2tp_vps
@@ -26,6 +28,7 @@ table inet l2tp_vps {
   chain mark {
     type route hook output priority mangle; policy accept;
     ct direction reply meta mark set $MARK
+    ct direction original meta mark set $TUNMARK
   }
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
@@ -89,12 +92,15 @@ guard() {
   copy_link_routes
   ip -4 route replace prohibit default metric 42700 table "$TABLE"
   rule -4 8900 "uidrange $FETCH_UID-$FETCH_UID lookup main" uidrange "$FETCH_UID-$FETCH_UID" table main
+  # 8904 is after the maintenance UID rule and before any leftover "from native address" rule.
+  rule -4 8904 "fwmark $TUNMARK lookup $TABLE" fwmark "$TUNMARK" table "$TABLE"
   rule -4 8905 "fwmark $MARK lookup main" fwmark "$MARK" table main
   rule -4 8920 "from all lookup $TABLE" table "$TABLE"
   rule -4 8930 "blackhole" blackhole
   if ipv6_on; then
     ip -6 route replace prohibit default metric 42700 table "$TABLE"
     rule -6 8900 "uidrange $FETCH_UID-$FETCH_UID lookup main" uidrange "$FETCH_UID-$FETCH_UID" table main
+    rule -6 8904 "fwmark $TUNMARK lookup $TABLE" fwmark "$TUNMARK" table "$TABLE"
     rule -6 8905 "fwmark $MARK lookup main" fwmark "$MARK" table main
     # Neighbour discovery needs the native link while ordinary IPv6 stays closed.
     rule -6 8911 'to fe80::/10 lookup main' to fe80::/10 table main
@@ -215,10 +221,12 @@ policy_missing() {
   # nft can still be present after a reboot while the policy rules are gone.
   nft list table inet l2tp_vps >/dev/null 2>&1 || return 0
   legacy_source_rule && return 0
+  ip -4 rule show pref 8904 | grep -q "fwmark $TUNMARK" || return 0
   ip -4 rule show pref 8905 | grep -q "fwmark $MARK" || return 0
   ip -4 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
   ip -4 rule show pref 8930 | grep -q blackhole || return 0
   if ipv6_on; then
+    ip -6 rule show pref 8904 | grep -q "fwmark $TUNMARK" || return 0
     ip -6 rule show pref 8905 | grep -q "fwmark $MARK" || return 0
     ip -6 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
     ip -6 rule show pref 8930 | grep -q blackhole || return 0
@@ -287,11 +295,13 @@ stop_services() {
 remove_routes() {
   # Full selectors are intentional. Never delete rules by priority alone.
   ip -4 rule del pref 8900 uidrange "$FETCH_UID-$FETCH_UID" table main 2>/dev/null || true
+  ip -4 rule del pref 8904 fwmark "$TUNMARK" table "$TABLE" 2>/dev/null || true
   ip -4 rule del pref 8905 fwmark "$MARK" table main 2>/dev/null || true
   drop_legacy_source_rules
   ip -4 rule del pref 8920 table "$TABLE" 2>/dev/null || true
   ip -4 rule del pref 8930 blackhole 2>/dev/null || true
   ip -6 rule del pref 8900 uidrange "$FETCH_UID-$FETCH_UID" table main 2>/dev/null || true
+  ip -6 rule del pref 8904 fwmark "$TUNMARK" table "$TABLE" 2>/dev/null || true
   ip -6 rule del pref 8905 fwmark "$MARK" table main 2>/dev/null || true
   ip -6 rule del pref 8911 to fe80::/10 table main 2>/dev/null || true
   ip -6 rule del pref 8911 to ff02::/16 table main 2>/dev/null || true
