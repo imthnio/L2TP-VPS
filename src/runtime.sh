@@ -149,6 +149,21 @@ EOF
   [ -s "$tmp/out/payload" ] || exit 1
   cat "$tmp/out/payload" > "$dest"
 )
+policy_missing() {
+  # nft can still be present after a reboot while the policy rules are gone.
+  nft list table inet l2tp_vps >/dev/null 2>&1 || return 0
+  ip -4 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
+  if ipv6_on; then
+    ip -6 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
+  fi
+  return 1
+}
+restore_policy() {
+  if policy_missing; then
+    guard
+    endpoint_route
+  fi
+}
 refresh() (
   # Serialize endpoint changes with upgrades; stale /run locks vanish on reboot.
   mkdir /run/l2tp-vps-refresh.lock 2>/dev/null || exit 0
@@ -180,7 +195,7 @@ watch() {
   while :; do
     sleep 60
     [ ! -f "$STATE/disabled" ] || continue
-    (load; refresh) || true
+    (load; refresh; restore_policy) || true
     # A late global IPv6 assignment must not depend on a 10-second polling window.
     peer_v6 "$PEER" '' '' '' '' "$TAG" || true
   done
@@ -251,6 +266,8 @@ recover() {
   legacy_routes
   restore_dns
   nft delete table inet l2tp_vps 2>/dev/null || true
+  rm -f /etc/systemd/networkd.conf.d/l2tp-vps.conf
+  rmdir /etc/systemd/networkd.conf.d 2>/dev/null || true
   printf '%s\n' '已恢复 VPS 原生出站。L2TP 和断线保护已关闭；账号和备份保留。重新运行安装命令可恢复隧道。'
 }
 uninstall() {
