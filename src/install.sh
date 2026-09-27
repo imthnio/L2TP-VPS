@@ -1,7 +1,8 @@
 #!/bin/sh
 # L2TP-VPS installer; generated with tools/build.py. Download this file, then run sh.
 set -eu
-VERSION=2.0.4
+trap '' HUP
+VERSION=2.0.5
 case "${1:-}" in --version) echo "$VERSION"; exit 0;; esac
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
