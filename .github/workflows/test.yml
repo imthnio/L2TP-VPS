@@ -1,0 +1,23 @@
+name: Installer regression
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  shell-and-network:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y nftables iproute2 curl shellcheck
+      - name: Generated installer and shell checks
+        run: |
+          python3 tools/build.py
+          git diff --exit-code -- install.sh SHA256SUMS
+          shellcheck -S warning install.sh bootstrap.sh src/runtime.sh
+          python3 tests/test_runtime.py
+          python3 tests/test_lifecycle.py
+      - name: Linux kernel routing and firewall regression
+        run: sudo python3 tests/test_netns.py
