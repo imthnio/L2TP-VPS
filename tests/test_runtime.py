@@ -116,7 +116,7 @@ nft() { cat >/dev/null; }
         out=self.run_sh('render_firewall')
         self.assertIn('ct direction reply ct state established,related accept',out)
         self.assertIn('ct direction reply meta mark set 0x24680',out)
-        self.assertIn('ct direction original meta mark set 0x24681',out)
+        self.assertNotIn('ct direction original meta mark set 0x24681',out)
         self.assertIn('type route hook output',out)
         self.assertIn('masquerade',out)
         self.assertNotIn('ip saddr 192.0.2.10 accept',out)

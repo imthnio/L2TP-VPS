@@ -13,10 +13,9 @@ fatal() { printf '%s\n' "$*" >&2; exit 1; }
 load() { [ -f "$STATE/v2-owned" ] || fatal '尚未安装新版'; . "$STATE/net.env"; }
 ipv6_on() { [ -e /proc/net/if_inet6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" != 1 ]; }
 render_firewall() {
-  # A reply to a connection that arrived here is marked so a second lookup
-  # sends it back out the native NIC. Every locally started packet is marked
-  # with a different value so that second lookup enters the tunnel, then the
-  # source is rewritten to the tunnel address.
+  # Replies are marked so a second lookup sends them out the native NIC.
+  # New connections are not marked: rule 8920 already selects the tunnel table,
+  # and marking them again drops the maintenance UID on the second lookup.
   cat <<EOF
 add table inet l2tp_vps
 flush table inet l2tp_vps
@@ -24,13 +23,6 @@ table inet l2tp_vps {
   chain l2tp_route {
     type route hook output priority mangle; policy accept;
     ct direction reply meta mark set $MARK
-    ip6 daddr fe80::/10 return
-    ip6 daddr ff00::/8 return
-    ip6 hoplimit 255 icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } return
-    udp sport 68 udp dport 67 return
-    udp sport 546 udp dport 547 return
-    meta skuid $FETCH_UID return
-    ct direction original meta mark set $TUNMARK
   }
   chain l2tp_nat {
     type nat hook postrouting priority srcnat; policy accept;
