@@ -94,8 +94,10 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         curl(client,'http://[2001:db8:1::20]:18082','--interface','2001:db8:1::10',okay=False)
         assert curl(server,'http://192.0.2.10:18081')=='192.0.2.20'
         assert curl(server,'http://[2001:db8:1::10]:18083')=='2001:db8:1::20'
-        maintenance=ns(client,'setpriv','--reuid','65534','--regid','65534','--clear-groups','curl','--noproxy','*','-fsS','--max-time','2','http://203.0.113.1:443')
-        assert maintenance.stdout=='192.0.2.10'
+        maintenance=ns(client,'setpriv','--reuid','65534','--regid','65534','--clear-groups','curl','--noproxy','*','-fsS','--max-time','2','http://203.0.113.1:443', check=False)
+        if maintenance.returncode or maintenance.stdout.strip()!='192.0.2.10':
+            dump=ns(client,'sh','-c','echo RULE; ip rule; echo ROUTE; ip route; echo T24680; ip route show table 24680; echo GET; ip route get 203.0.113.1; echo GETUID; ip route get 203.0.113.1 uid 65534; echo NFT; nft list table inet l2tp_vps', check=False)
+            raise AssertionError(maintenance.stdout+'\n'+maintenance.stderr+'\n'+dump.stdout+'\n'+dump.stderr)
         curl(client,'http://203.0.113.1:443','--interface','192.0.2.10',okay=False)
         print('PASS: offline IPv4/IPv6 fail closed; bound-native cannot use the VPS; incoming replies and maintenance UID work')
         # A veth named like our isolated peer simulates a point-to-point egress.
