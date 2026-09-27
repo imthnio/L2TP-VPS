@@ -189,7 +189,7 @@ worker() {
 
     def test_version_does_not_install(self):
         r=subprocess.run(['/bin/sh',str(ROOT/'install.sh'),'--version'],text=True,capture_output=True,check=True)
-        self.assertEqual(r.stdout.strip(),'2.0.4')
+        self.assertEqual(r.stdout.strip(),'2.0.5')
 
     def test_failure_recovery_precedes_first_guard(self):
         self.assertLess(INSTALL.index('cat > "$RUNTIME.new"'),INSTALL.index('"$RUNTIME" guard'))
