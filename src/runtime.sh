@@ -110,11 +110,17 @@ EOF
   chmod 755 "$tmp/worker"
   result=$(worker "$tmp/worker" 2>/dev/null || true)
   rm -rf "$tmp"
-  printf '%s\n' "$result" | awk '
+  # Keep the current address when it is still published. Record order alone must not reconnect.
+  picked=$(printf '%s\n' "$result" | awk '
     function valid(x, a,n,i) { n=split(x,a,"."); if(n!=4)return 0; for(i=1;i<=4;i++)if(a[i]!~/^[0-9]+$/||a[i]>255)return 0; return 1 }
-    valid($1) { print $1; exit }
+    valid($1) { print $1 }
     /^Name:/ { answer=1 }
-    answer && /^Address:/ && valid($2) { print $2; exit }'
+    answer && /^Address/ { for (i=1; i<=NF; i++) if (valid($i)) print $i }')
+  if [ -n "${ENDPOINT:-}" ] && printf '%s\n' "$picked" | grep -Fx -- "$ENDPOINT" >/dev/null; then
+    printf '%s\n' "$ENDPOINT"
+  else
+    printf '%s\n' "$picked" | awk 'NF {print; exit}'
+  fi
 }
 fetch() (
   url=$1; dest=$2
@@ -134,7 +140,7 @@ fetch() (
   cat > "$tmp/worker" <<EOF
 #!/bin/sh
 answer=\$(timeout 15 nslookup -type=A '$host' 1.1.1.1 2>/dev/null || timeout 15 nslookup -type=A '$host' 9.9.9.9 2>/dev/null)
-addr=\$(printf '%s\\n' "\$answer" | awk '/^Name:/ {a=1} a && /^Address:/ && \$2 ~ /^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$/ {print \$2; exit}')
+addr=\$(printf '%s\\n' "\$answer" | awk '/^Name:/ {a=1} a && /^Address/ { for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+\$/) {print \$i; exit} }')
 [ -n "\$addr" ] || exit 1
 exec curl --resolve '$host:443:'"\$addr" -4 --noproxy '*' --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 15 --max-time 90 --retry 2 -o '$tmp/out/payload' '$url'
 EOF
@@ -148,22 +154,27 @@ refresh() (
   mkdir /run/l2tp-vps-refresh.lock 2>/dev/null || exit 0
   trap 'rmdir /run/l2tp-vps-refresh.lock' EXIT
   [ ! -d /run/l2tp-vps-install.lock ] || exit 0
-  ip -4 addr show dev "$PEER" 2>/dev/null | grep -q 'inet ' && exit 0
+  if ip -4 addr show dev "$PEER" 2>/dev/null | grep -q 'inet '; then
+    exit 0
+  fi
   new=$(resolve)
-  [ -n "$new" ] || exit 0
-  [ "$new" != "$ENDPOINT" ] || exit 0
-  old=$ENDPOINT
-  ENDPOINT=$new
-  endpoint_route
-  # Replace the firewall and disk config before restarting only our daemon.
-  guard
-  sed "s/^ENDPOINT=.*/ENDPOINT=$ENDPOINT/" "$STATE/net.env" > "$STATE/net.env.new"
-  chmod 600 "$STATE/net.env.new"
-  mv "$STATE/net.env.new" "$STATE/net.env"
-  sed "s/^lns = .*/lns = $ENDPOINT/" "$STATE/xl2tpd.conf" > "$STATE/xl2tpd.conf.new"
-  mv "$STATE/xl2tpd.conf.new" "$STATE/xl2tpd.conf"
-  ip -4 route del "$old/32" table "$TABLE" 2>/dev/null || true
-  service restart
+  if [ -n "$new" ] && [ "$new" != "$ENDPOINT" ]; then
+    old=$ENDPOINT
+    ENDPOINT=$new
+    endpoint_route
+    # Replace the firewall and disk config before restarting only our daemon.
+    guard
+    sed "s/^ENDPOINT=.*/ENDPOINT=$ENDPOINT/" "$STATE/net.env" > "$STATE/net.env.new"
+    chmod 600 "$STATE/net.env.new"
+    mv "$STATE/net.env.new" "$STATE/net.env"
+    sed "s/^lns = .*/lns = $ENDPOINT/" "$STATE/xl2tpd.conf" > "$STATE/xl2tpd.conf.new"
+    mv "$STATE/xl2tpd.conf.new" "$STATE/xl2tpd.conf"
+    ip -4 route del "$old/32" table "$TABLE" 2>/dev/null || true
+    service restart
+  else
+    # Same or unknown address: the native gateway may still have moved.
+    endpoint_route
+  fi
 )
 watch() {
   while :; do
@@ -240,7 +251,7 @@ recover() {
   legacy_routes
   restore_dns
   nft delete table inet l2tp_vps 2>/dev/null || true
-  printf '%s\n' '已恢复 VPS 原生出站。此时不再使用 A&A 保护；账号和备份保留。重新运行安装命令可恢复隧道。'
+  printf '%s\n' '已恢复 VPS 原生出站。L2TP 和断线保护已关闭；账号和备份保留。重新运行安装命令可恢复隧道。'
 }
 uninstall() {
   recover
@@ -258,7 +269,13 @@ uninstall() {
 update() (
   tmp=$(mktemp -d /tmp/l2tp-update.XXXXXXXX)
   trap 'rm -rf "$tmp"' EXIT
-  fetch "https://raw.githubusercontent.com/imthnio/L2TP-VPS/main/bootstrap.sh?cb=$(date +%s)" "$tmp/bootstrap.sh"
+  fetch "https://api.github.com/repos/imthnio/L2TP-VPS/commits/main?cb=$(date +%s)" "$tmp/commit.json" || fatal '无法确认最新版本（网络错误或 GitHub API 限流），未安装缓存旧版'
+  commit=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$tmp/commit.json" | head -1)
+  [ "${#commit}" = 40 ] || fatal 'GitHub 未返回有效提交'
+  case "$commit" in *[!0-9a-f]*) fatal 'GitHub 未返回有效提交';; esac
+  fetch "https://raw.githubusercontent.com/imthnio/L2TP-VPS/$commit/bootstrap.sh" "$tmp/bootstrap.sh" ||
+    fetch "https://cdn.jsdelivr.net/gh/imthnio/L2TP-VPS@$commit/bootstrap.sh" "$tmp/bootstrap.sh" ||
+    fatal '无法下载安装入口'
   sh -n "$tmp/bootstrap.sh"
   sh "$tmp/bootstrap.sh"
 )

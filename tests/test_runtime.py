@@ -25,7 +25,7 @@ class RuntimeTests(unittest.TestCase):
 NATIVE_IF=eth0
 NATIVE_IP=192.0.2.10
 ENDPOINT=198.51.100.1
-SERVER=l2tp.aa.net.uk
+SERVER=l2tp.example.net
 FETCH_UID=987
 INIT=systemd
 ip() { printf 'IP %s\\n' "$*"; }
@@ -131,7 +131,7 @@ worker() {
 
     def test_version_does_not_install(self):
         r=subprocess.run(['/bin/sh',str(ROOT/'install.sh'),'--version'],text=True,capture_output=True,check=True)
-        self.assertEqual(r.stdout.strip(),'2.0.0')
+        self.assertEqual(r.stdout.strip(),'2.0.1')
 
     def test_failure_recovery_precedes_first_guard(self):
         self.assertLess(INSTALL.index('cat > "$RUNTIME.new"'),INSTALL.index('"$RUNTIME" guard'))
@@ -145,6 +145,68 @@ worker() {
         self.assertIn('[ "$expected" = "$actual" ]',src)
         self.assertNotIn('L2TP-VPS@main/install.sh',src)
         self.assertNotIn('/tmp/l2tp-vps-install.sh',src)
+
+    def test_update_pins_bootstrap_to_the_commit(self):
+        src = RUNTIME
+        self.assertIn('/commits/main?', src)
+        self.assertIn('L2TP-VPS@$commit/bootstrap.sh', src)
+        self.assertNotIn('L2TP-VPS/main/bootstrap.sh', src)
+
+    def test_user_text_does_not_name_a_provider(self):
+        blob = '\n'.join([
+            INSTALL,
+            RUNTIME,
+            (ROOT/'README.md').read_text(),
+            (ROOT/'bootstrap.sh').read_text(),
+        ])
+        self.assertNotIn('A&A', blob)
+        self.assertNotIn('aa.net.uk', blob)
+        self.assertNotIn('Andrews', blob)
+        self.assertIn('PEER=l2tp-aa', INSTALL)
+        self.assertIn('PEER=l2tp-aa', RUNTIME)
+        self.assertIn('ifname l2tp-aa', INSTALL)
+
+    def test_resolve_keeps_current_address_when_dns_lists_several(self):
+        out = self.run_sh('resolve; ENDPOINT=203.0.113.8; resolve', '''
+worker() { printf '%s\\n' 'Name: l2tp.example.net' 'Address: 203.0.113.10' 'Address: 198.51.100.1'; }
+''')
+        self.assertEqual(out.splitlines(), ['198.51.100.1', '203.0.113.10'])
+
+    def test_resolve_reads_busybox_nslookup(self):
+        out = self.run_sh('resolve', '''
+worker() { printf '%s\\n' 'Server:    1.1.1.1' 'Address 1: 1.1.1.1 one.one.one.one' 'Name:    l2tp.example.net' 'Address 1: 203.0.113.10 l2tp.example.net' 'Address 1: 198.51.100.1 l2tp.example.net'; }
+''')
+        self.assertEqual(out.strip(), '198.51.100.1')
+
+    def test_refresh_repairs_route_without_restart_when_address_is_unchanged(self):
+        out = self.run_sh('refresh', '''
+mkdir() { :; }
+rmdir() { :; }
+resolve() { printf '%s\\n' "$ENDPOINT"; }
+endpoint_route() { echo ROUTE; }
+guard() { echo GUARD; }
+service() { echo RESTART; }
+''')
+        self.assertIn('ROUTE', out)
+        self.assertNotIn('GUARD', out)
+        self.assertNotIn('RESTART', out)
+
+    def test_refresh_switches_endpoint_when_dns_withdraws_it(self):
+        out = self.run_sh('refresh; printf FILE:%s\\n "$(cat "$STATE/net.env")"; printf LNS:%s\\n "$(cat "$STATE/xl2tpd.conf")"', '''
+mkdir() { :; }
+rmdir() { :; }
+resolve() { printf '%s\\n' '203.0.113.9'; }
+endpoint_route() { echo ROUTE; }
+guard() { echo GUARD; }
+service() { echo RESTART; }
+printf 'ENDPOINT=198.51.100.1\\n' > "$STATE/net.env"
+printf 'lns = 198.51.100.1\\n' > "$STATE/xl2tpd.conf"
+''')
+        self.assertIn('ROUTE', out)
+        self.assertIn('GUARD', out)
+        self.assertIn('RESTART', out)
+        self.assertIn('FILE:ENDPOINT=203.0.113.9', out)
+        self.assertIn('LNS:lns = 203.0.113.9', out)
 
 class LegacyPasswordTests(unittest.TestCase):
     def test_actual_migration_parser_roundtrips_special_characters(self):

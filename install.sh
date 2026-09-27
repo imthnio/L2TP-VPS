@@ -1,13 +1,14 @@
 #!/bin/sh
 # L2TP-VPS installer; generated with tools/build.py. Download this file, then run sh.
 set -eu
-VERSION=2.0.0
+VERSION=2.0.1
 case "${1:-}" in --version) echo "$VERSION"; exit 0;; esac
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 umask 077
 STATE=/etc/l2tp-vless
 RUNTIME=/usr/local/sbin/l2tp-vps
+PEER=l2tp-aa
 LEGACY=0
 SUCCESS=0
 BACKUP=
@@ -75,7 +76,7 @@ ask() {
   printf '%s: ' "$1"
   IFS= read -r answer || fatal '输入已取消'
 }
-[ -n "$SERVER" ] || { ask 'L2TP 服务器（建议 l2tp.aa.net.uk）'; SERVER=$answer; }
+[ -n "$SERVER" ] || { ask 'L2TP 服务器（域名或 IPv4）'; SERVER=$answer; }
 [ -n "$USER_NAME" ] || { ask 'L2TP 用户名'; USER_NAME=$answer; }
 if [ -z "$PASSWORD" ]; then
   [ -t 0 ] || fatal '缺少 L2TP_PASS'
@@ -88,7 +89,8 @@ if [ -z "$PASSWORD" ]; then
   trap 'exit 143' TERM
 fi
 case "$SERVER" in ''|*[!A-Za-z0-9.-]*|-*) fatal '服务器必须是域名或 IPv4';; esac
-case "$USER_NAME" in ''|*[!A-Za-z0-9@._+-]*) fatal '用户名格式不支持';; esac
+# Usernames are provider-defined. Keep them out of the shell; pppd gets a quoted word.
+[ -n "$USER_NAME" ] && [ "$USER_NAME" = "$(printf '%s' "$USER_NAME" | tr -d '\r\n')" ] || fatal '用户名为空或包含换行'
 [ -n "$PASSWORD" ] && [ "$PASSWORD" = "$(printf '%s' "$PASSWORD" | tr -d '\r\n')" ] || fatal '密码为空或包含换行'
 info "准备安装/升级至 ${VERSION}；已有账号会自动复用"
 if [ "$LEGACY" = 1 ] && [ ! -f "$STATE/legacy-routes.env" ]; then
@@ -97,7 +99,7 @@ if [ "$LEGACY" = 1 ] && [ ! -f "$STATE/legacy-routes.env" ]; then
   touch "$STATE/legacy-pending"
 fi
 if [ "$LEGACY" = 1 ] && [ -z "${L2TP_SERVER:-}" ]; then
-  info '旧版只保存了服务器 IP；本次保留该 IP。若要自动跟随 A&A 接入地址变更，请设置 L2TP_SERVER=l2tp.aa.net.uk 后再次升级。'
+  info '旧版只保存了服务器 IP；本次保留该 IP。若接入点是域名，希望断线后重新解析，请设置 L2TP_SERVER=你的域名 后再次升级。'
 fi
 
 if [ "$LEGACY" = 1 ] && [ ! -f "$STATE/legacy-detached" ]; then
@@ -131,7 +133,7 @@ if [ ! -f "$STATE/v2-owned" ]; then
     done
   done
   nft list table inet l2tp_vps >/dev/null 2>&1 && fatal '同名 nftables 表已存在，拒绝覆盖'
-  ip link show l2tp-aa >/dev/null 2>&1 && fatal '接口 l2tp-aa 已存在，拒绝接管'
+  ip link show "$PEER" >/dev/null 2>&1 && fatal "接口 $PEER 已存在，拒绝接管"
   if id l2tp-fetch >/dev/null 2>&1; then
     [ -f "$STATE/fetch-uid" ] && [ "$(cat "$STATE/fetch-uid")" = "$(id -u l2tp-fetch)" ] || fatal '用户 l2tp-fetch 已存在，拒绝接管'
   elif [ "$INIT" = openrc ]; then adduser -S -D -H -s /sbin/nologin l2tp-fetch
@@ -279,11 +281,17 @@ EOF
   chmod 755 "$tmp/worker"
   result=$(worker "$tmp/worker" 2>/dev/null || true)
   rm -rf "$tmp"
-  printf '%s\n' "$result" | awk '
+  # Keep the current address when it is still published. Record order alone must not reconnect.
+  picked=$(printf '%s\n' "$result" | awk '
     function valid(x, a,n,i) { n=split(x,a,"."); if(n!=4)return 0; for(i=1;i<=4;i++)if(a[i]!~/^[0-9]+$/||a[i]>255)return 0; return 1 }
-    valid($1) { print $1; exit }
+    valid($1) { print $1 }
     /^Name:/ { answer=1 }
-    answer && /^Address:/ && valid($2) { print $2; exit }'
+    answer && /^Address/ { for (i=1; i<=NF; i++) if (valid($i)) print $i }')
+  if [ -n "${ENDPOINT:-}" ] && printf '%s\n' "$picked" | grep -Fx -- "$ENDPOINT" >/dev/null; then
+    printf '%s\n' "$ENDPOINT"
+  else
+    printf '%s\n' "$picked" | awk 'NF {print; exit}'
+  fi
 }
 fetch() (
   url=$1; dest=$2
@@ -303,7 +311,7 @@ fetch() (
   cat > "$tmp/worker" <<EOF
 #!/bin/sh
 answer=\$(timeout 15 nslookup -type=A '$host' 1.1.1.1 2>/dev/null || timeout 15 nslookup -type=A '$host' 9.9.9.9 2>/dev/null)
-addr=\$(printf '%s\\n' "\$answer" | awk '/^Name:/ {a=1} a && /^Address:/ && \$2 ~ /^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$/ {print \$2; exit}')
+addr=\$(printf '%s\\n' "\$answer" | awk '/^Name:/ {a=1} a && /^Address/ { for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+\$/) {print \$i; exit} }')
 [ -n "\$addr" ] || exit 1
 exec curl --resolve '$host:443:'"\$addr" -4 --noproxy '*' --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 15 --max-time 90 --retry 2 -o '$tmp/out/payload' '$url'
 EOF
@@ -317,22 +325,27 @@ refresh() (
   mkdir /run/l2tp-vps-refresh.lock 2>/dev/null || exit 0
   trap 'rmdir /run/l2tp-vps-refresh.lock' EXIT
   [ ! -d /run/l2tp-vps-install.lock ] || exit 0
-  ip -4 addr show dev "$PEER" 2>/dev/null | grep -q 'inet ' && exit 0
+  if ip -4 addr show dev "$PEER" 2>/dev/null | grep -q 'inet '; then
+    exit 0
+  fi
   new=$(resolve)
-  [ -n "$new" ] || exit 0
-  [ "$new" != "$ENDPOINT" ] || exit 0
-  old=$ENDPOINT
-  ENDPOINT=$new
-  endpoint_route
-  # Replace the firewall and disk config before restarting only our daemon.
-  guard
-  sed "s/^ENDPOINT=.*/ENDPOINT=$ENDPOINT/" "$STATE/net.env" > "$STATE/net.env.new"
-  chmod 600 "$STATE/net.env.new"
-  mv "$STATE/net.env.new" "$STATE/net.env"
-  sed "s/^lns = .*/lns = $ENDPOINT/" "$STATE/xl2tpd.conf" > "$STATE/xl2tpd.conf.new"
-  mv "$STATE/xl2tpd.conf.new" "$STATE/xl2tpd.conf"
-  ip -4 route del "$old/32" table "$TABLE" 2>/dev/null || true
-  service restart
+  if [ -n "$new" ] && [ "$new" != "$ENDPOINT" ]; then
+    old=$ENDPOINT
+    ENDPOINT=$new
+    endpoint_route
+    # Replace the firewall and disk config before restarting only our daemon.
+    guard
+    sed "s/^ENDPOINT=.*/ENDPOINT=$ENDPOINT/" "$STATE/net.env" > "$STATE/net.env.new"
+    chmod 600 "$STATE/net.env.new"
+    mv "$STATE/net.env.new" "$STATE/net.env"
+    sed "s/^lns = .*/lns = $ENDPOINT/" "$STATE/xl2tpd.conf" > "$STATE/xl2tpd.conf.new"
+    mv "$STATE/xl2tpd.conf.new" "$STATE/xl2tpd.conf"
+    ip -4 route del "$old/32" table "$TABLE" 2>/dev/null || true
+    service restart
+  else
+    # Same or unknown address: the native gateway may still have moved.
+    endpoint_route
+  fi
 )
 watch() {
   while :; do
@@ -409,7 +422,7 @@ recover() {
   legacy_routes
   restore_dns
   nft delete table inet l2tp_vps 2>/dev/null || true
-  printf '%s\n' '已恢复 VPS 原生出站。此时不再使用 A&A 保护；账号和备份保留。重新运行安装命令可恢复隧道。'
+  printf '%s\n' '已恢复 VPS 原生出站。L2TP 和断线保护已关闭；账号和备份保留。重新运行安装命令可恢复隧道。'
 }
 uninstall() {
   recover
@@ -427,7 +440,13 @@ uninstall() {
 update() (
   tmp=$(mktemp -d /tmp/l2tp-update.XXXXXXXX)
   trap 'rm -rf "$tmp"' EXIT
-  fetch "https://raw.githubusercontent.com/imthnio/L2TP-VPS/main/bootstrap.sh?cb=$(date +%s)" "$tmp/bootstrap.sh"
+  fetch "https://api.github.com/repos/imthnio/L2TP-VPS/commits/main?cb=$(date +%s)" "$tmp/commit.json" || fatal '无法确认最新版本（网络错误或 GitHub API 限流），未安装缓存旧版'
+  commit=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$tmp/commit.json" | head -1)
+  [ "${#commit}" = 40 ] || fatal 'GitHub 未返回有效提交'
+  case "$commit" in *[!0-9a-f]*) fatal 'GitHub 未返回有效提交';; esac
+  fetch "https://raw.githubusercontent.com/imthnio/L2TP-VPS/$commit/bootstrap.sh" "$tmp/bootstrap.sh" ||
+    fetch "https://cdn.jsdelivr.net/gh/imthnio/L2TP-VPS@$commit/bootstrap.sh" "$tmp/bootstrap.sh" ||
+    fatal '无法下载安装入口'
   sh -n "$tmp/bootstrap.sh"
   sh "$tmp/bootstrap.sh"
 )
@@ -478,7 +497,16 @@ if [ -f "$STATE/net.env" ]; then
 fi
 case "$SERVER" in
   *[!0-9.]* )
-    resolved=$(getent ahostsv4 "$SERVER" 2>/dev/null | awk '$1~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/{print $1;exit}' || true)
+    # getent uses the VPS resolver and may be missing. A public resolver is the fallback.
+    resolved=$(timeout 15 getent ahostsv4 "$SERVER" 2>/dev/null | awk '
+      function valid(x, a,n,i) { n=split(x,a,"."); if(n!=4)return 0; for(i=1;i<=4;i++)if(a[i]!~/^[0-9]+$/||a[i]>255)return 0; return 1 }
+      valid($1) { print $1; exit }' || true)
+    if [ -z "$resolved" ]; then
+      resolved=$({ timeout 15 nslookup -type=A "$SERVER" 1.1.1.1 || timeout 15 nslookup -type=A "$SERVER" 9.9.9.9; } 2>/dev/null | awk '
+        function valid(x, a,n,i) { n=split(x,a,"."); if(n!=4)return 0; for(i=1;i<=4;i++)if(a[i]!~/^[0-9]+$/||a[i]>255)return 0; return 1 }
+        /^Name:/ { answer=1 }
+        answer && /^Address/ { for (i=1; i<=NF; i++) if (valid($i)) { print $i; exit } }' || true)
+    fi
     [ -z "$resolved" ] || ENDPOINT=$resolved;;
   *) ENDPOINT=$SERVER;;
 esac
@@ -501,7 +529,7 @@ write_peer() {
   cat > "$STATE/xl2tpd.conf" <<EOF
 [global]
 port = 0
-[lac aa]
+[lac vps]
 lns = $ENDPOINT
 autodial = yes
 redial = yes
@@ -511,8 +539,9 @@ pppoptfile = $STATE/options
 refuse pap = yes
 length bit = yes
 EOF
-  escaped=$(printf '%s' "$PASSWORD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-  cat > "$STATE/options" <<EOF
+  # Quoted heredoc would not expand ENDPOINT. Password must not go through an
+  # unquoted heredoc: $() and backticks in it would be executed by the shell.
+  cat > "$STATE/options" <<'EOF'
 ipcp-accept-local
 ipcp-accept-remote
 noipdefault
@@ -532,9 +561,10 @@ mtu 1400
 mru 1400
 ifname l2tp-aa
 ipparam l2tp-vps
-user "$USER_NAME"
-password "$escaped"
 EOF
+  user_q=$(printf '%s' "$USER_NAME" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  pass_q=$(printf '%s' "$PASSWORD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  printf 'user "%s"\npassword "%s"\n' "$user_q" "$pass_q" >> "$STATE/options"
   chmod 600 "$STATE/xl2tpd.conf" "$STATE/options"
 }
 write_peer
@@ -571,7 +601,7 @@ WantedBy=multi-user.target
 EOF
   cat > /etc/systemd/system/l2tp-vps.service <<'EOF'
 [Unit]
-Description=Isolated A&A L2TP connection
+Description=Isolated L2TP connection
 Requires=l2tp-vps-guard.service
 After=l2tp-vps-guard.service network-online.target
 Wants=network-online.target
@@ -588,7 +618,7 @@ WantedBy=multi-user.target
 EOF
   cat > /etc/systemd/system/l2tp-vps-watch.service <<'EOF'
 [Unit]
-Description=Refresh A&A endpoint after disconnect
+Description=Refresh L2TP endpoint after disconnect
 After=l2tp-vps.service
 ConditionPathExists=!/etc/l2tp-vless/disabled
 [Service]
@@ -692,17 +722,32 @@ else
   rc-service l2tp-vps restart || rc-service l2tp-vps start
   rc-service l2tp-vps-watch restart || rc-service l2tp-vps-watch start
 fi
-info '等待本项目的 A&A 连接（最多 90 秒）'
+info '等待 L2TP 连接（最多 90 秒）'
 connected=0
 for _attempt in $(seq 1 90); do
-  if ip -4 addr show dev l2tp-aa 2>/dev/null | grep -q 'inet ' && ip -4 route get 1.1.1.1 2>/dev/null | grep -q 'dev l2tp-aa'; then connected=1; break; fi
+  if ip -4 addr show dev "$PEER" 2>/dev/null | grep -q 'inet ' && ip -4 route get 1.1.1.1 2>/dev/null | grep -q "dev $PEER"; then connected=1; break; fi
   sleep 1
 done
-[ "$connected" = 1 ] || fatal 'A&A 拨号/路由未就绪；请检查账号、UDP 和 PPP 日志。不能仅凭此判定 A&A 账号欠费'
-out=$(curl -4 --noproxy '*' -fsS --connect-timeout 10 --max-time 20 https://api.ipify.org || curl -4 --noproxy '*' -fsS --connect-timeout 10 --max-time 20 https://ifconfig.me) || fatal '隧道出口验证失败（可能是 DNS、MTU、防火墙或服务端问题）'
-peer_ip=$(ip -4 -o addr show dev l2tp-aa | awk '{split($4,a,"/");print a[1];exit}')
-[ "$out" = "$peer_ip" ] || fatal "出口与 A&A 分配地址不一致；未标记升级成功"
-[ "$out" != "$NATIVE_IP" ] || fatal '出口仍为原生地址'
+[ "$connected" = 1 ] || fatal 'L2TP 拨号或路由未就绪。请检查服务器、账号、UDP 1701 和 PPP 日志。拨号失败不一定是账号欠费。'
+out=$(curl -4 --noproxy '*' -fsS --connect-timeout 10 --max-time 20 https://api.ipify.org || curl -4 --noproxy '*' -fsS --connect-timeout 10 --max-time 20 https://ifconfig.me || true)
+out=$(printf '%s' "$out" | tr -d '[:space:]')
+if ! printf '%s\n' "$out" | awk -F. 'NF!=4{exit 1}{for(i=1;i<=4;i++)if($i!~/^[0-9]+$/||$i>255)exit 1}'; then
+  # Hostname lookups can fail while the tunnel itself is up. This URL is an address.
+  trace=$(curl -4 --noproxy '*' -kfsS --connect-timeout 10 --max-time 20 https://1.1.1.1/cdn-cgi/trace || true)
+  out=$(printf '%s\n' "$trace" | awk -F= '$1=="ip" {print $2; exit}')
+  out=$(printf '%s' "$out" | tr -d '[:space:]')
+fi
+printf '%s\n' "$out" | awk -F. 'NF!=4{exit 1}{for(i=1;i<=4;i++)if($i!~/^[0-9]+$/||$i>255)exit 1}' || fatal '隧道出口验证没有返回有效 IPv4（可能是 DNS、MTU、防火墙或服务端问题）'
+[ "$out" != "$NATIVE_IP" ] || fatal '出口仍为 VPS 原生地址；未标记升级成功'
+# NAT is normal. The public address does not have to equal the PPP address.
+route_line=$(ip -4 route get 1.1.1.1 2>/dev/null || true)
+printf '%s\n' "$route_line" | grep -q "dev $PEER" || fatal '出站没有走隧道；未标记升级成功'
+route_src=$(printf '%s\n' "$route_line" | awk '{for(i=1;i<NF;i++) if($i=="src") {print $(i+1); exit}}')
+peer_ip=$(ip -4 -o addr show dev "$PEER" | awk '{split($4,a,"/");print a[1];exit}')
+[ -n "$peer_ip" ] || fatal '隧道没有 IPv4 地址；未标记升级成功'
+if [ -n "$route_src" ] && [ "$route_src" != "$peer_ip" ]; then
+  fatal '出站源地址不是隧道地址；未标记升级成功'
+fi
 # A bound-native NEW connection must now fail even though SSH replies still work.
 if curl -4 --noproxy '*' --interface "$NATIVE_IP" -kfsS --connect-timeout 3 --max-time 5 https://1.1.1.1 >/dev/null 2>&1; then
   fatal '原生出站隔离检查失败'

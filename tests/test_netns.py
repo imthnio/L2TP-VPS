@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Real Linux kernel test. All links, firewall and routes live in private netns.
-Run: sudo python3 tests/test_netns.py. Does NOT dial A&A or modify host networking.
+Run: sudo python3 tests/test_netns.py. Does not dial a remote L2TP server or modify host networking.
 """
 import os
 from pathlib import Path
@@ -34,7 +34,7 @@ STATE={shlex.quote(str(d))}
 NATIVE_IF=eth0
 NATIVE_IP=192.0.2.10
 ENDPOINT=192.0.2.20
-SERVER=l2tp.aa.net.uk
+SERVER=l2tp.example.net
 FETCH_UID=65534
 INIT=systemd
 '''
@@ -99,12 +99,12 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         run('ip','link','set','p'+suffix,'netns',client)
         run('ip','link','set','q'+suffix,'netns',server)
         ns(client,'ip','link','set','p'+suffix,'name','l2tp-aa')
-        ns(server,'ip','link','set','q'+suffix,'name','aa-peer')
+        ns(server,'ip','link','set','q'+suffix,'name','far-peer')
         ns(client,'ip','addr','add','198.18.0.1/24','dev','l2tp-aa')
-        ns(server,'ip','addr','add','198.18.0.2/24','dev','aa-peer')
+        ns(server,'ip','addr','add','198.18.0.2/24','dev','far-peer')
         ns(client,'ip','link','set','l2tp-aa','up')
-        ns(server,'ip','link','set','aa-peer','up')
-        # Weak-host ARP responds for 203.0.113.1, which the simulated A&A owns.
+        ns(server,'ip','link','set','far-peer','up')
+        # Weak-host ARP responds for 203.0.113.1, which stands in for the remote peer.
         runtime('peer_up l2tp-aa tty 0 198.18.0.1 198.18.0.2 l2tp-vps')
         assert curl(client,'http://203.0.113.1:18080')=='198.18.0.1'
         runtime('peer_up ppp9 tty 0 1 2 foreign')
