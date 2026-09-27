@@ -121,7 +121,7 @@ class LifecycleTests(unittest.TestCase):
   self.install(first=False)
   self.assertEqual((state/'password').read_bytes(),password)
   self.assertTrue((state/'rollback-path').exists())
-  self.assertEqual((state/'installed-version').read_text().strip(),'2.0.3')
+  self.assertEqual((state/'installed-version').read_text().strip(),'2.0.4')
   self.assertTrue(self.model()['guard'])
   self.assertEqual((self.d/'etc/resolv.conf').read_text().splitlines()[0],'nameserver 1.1.1.1')
   options=(state/'options').read_text()
