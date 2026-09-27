@@ -1,7 +1,7 @@
 #!/bin/sh
 # L2TP-VPS installer; generated with tools/build.py. Download this file, then run sh.
 set -eu
-VERSION=2.0.3
+VERSION=2.0.4
 case "${1:-}" in --version) echo "$VERSION"; exit 0;; esac
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -128,7 +128,7 @@ modprobe ppp_generic 2>/dev/null || true
 if [ ! -f "$STATE/v2-owned" ]; then
   for family in -4 -6; do
     [ -z "$(ip "$family" route show table 24680 2>/dev/null)" ] || fatal '路由表 24680 已被其他软件使用'
-    for pref in 8900 8905 8910 8911 8920 8930; do
+    for pref in 8900 8904 8905 8910 8911 8920 8930; do
       [ -z "$(ip "$family" rule show pref "$pref" 2>/dev/null)" ] || fatal "路由优先级 $pref 已被其他软件使用"
     done
   done

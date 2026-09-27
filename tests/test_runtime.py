@@ -81,6 +81,7 @@ nft() { printf 'NFT %s\\n' "$*"; cat >/dev/null; }
         out=self.run_sh('restore_policy', '''
 ip() {
   case "$*" in
+    '-4 rule show pref 8904') printf '%s\\n' '8904: from all fwmark 0x24681 lookup 24680';;
     '-4 rule show pref 8905') printf '%s\\n' '8905: from all fwmark 0x24680 lookup main';;
     '-4 rule show pref 8920') printf '%s\\n' '8920: from all lookup 24680';;
     '-4 rule show pref 8930') printf '%s\\n' '8930: from all blackhole';;
@@ -104,6 +105,7 @@ ip() {
 }
 nft() { cat >/dev/null; }
 ''')
+        self.assertIn('-4 rule add pref 8904 fwmark 0x24681 table 24680', out)
         self.assertIn('-4 rule add pref 8905 fwmark 0x24680 table main', out)
         self.assertIn('-4 rule add pref 8920 table 24680', out)
         self.assertIn('-4 rule add pref 8930 blackhole', out)
@@ -114,6 +116,7 @@ nft() { cat >/dev/null; }
         out=self.run_sh('render_firewall')
         self.assertIn('ct direction reply ct state established,related accept',out)
         self.assertIn('ct direction reply meta mark set 0x24680',out)
+        self.assertIn('ct direction original meta mark set 0x24681',out)
         self.assertIn('type route hook output',out)
         self.assertIn('masquerade',out)
         self.assertNotIn('ip saddr 192.0.2.10 accept',out)
@@ -125,6 +128,7 @@ nft() { cat >/dev/null; }
     def test_cleanup_is_scoped_and_preserves_other_routes(self):
         out=self.run_sh('remove_routes')
         self.assertIn('pref 8910 from 192.0.2.11/32 table main',out)
+        self.assertIn('pref 8904 fwmark 0x24681 table 24680',out)
         self.assertIn('pref 8905 fwmark 0x24680 table main',out)
         self.assertIn('pref 8930 blackhole',out)
         self.assertNotIn('route flush',out)
@@ -185,7 +189,7 @@ worker() {
 
     def test_version_does_not_install(self):
         r=subprocess.run(['/bin/sh',str(ROOT/'install.sh'),'--version'],text=True,capture_output=True,check=True)
-        self.assertEqual(r.stdout.strip(),'2.0.3')
+        self.assertEqual(r.stdout.strip(),'2.0.4')
 
     def test_failure_recovery_precedes_first_guard(self):
         self.assertLess(INSTALL.index('cat > "$RUNTIME.new"'),INSTALL.index('"$RUNTIME" guard'))
