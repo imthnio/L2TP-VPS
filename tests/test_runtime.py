@@ -61,6 +61,35 @@ ip() { case "$*" in '-6 addr show dev l2tp-aa scope global') echo 'inet6 2001:db
         self.assertNotIn('prohibit',out)
         self.assertNotIn('flush',out)
 
+    def test_missing_policy_is_restored_without_flushing_foreign_state(self):
+        out=self.run_sh('restore_policy', '''
+ip() {
+  case "$*" in
+    '-4 route show default table main') echo 'default via 192.0.2.1 dev eth0';;
+    *) printf 'IP %s\\n' "$*";;
+  esac
+}
+nft() { printf 'NFT %s\\n' "$*"; cat >/dev/null; }
+''')
+        self.assertIn('NFT -f -', out)
+        self.assertIn('-4 rule add pref 8920 table 24680', out)
+        self.assertIn('-4 route replace 198.51.100.1/32 via 192.0.2.1 dev eth0 onlink table 24680', out)
+        self.assertNotIn('rule flush', out)
+        self.assertNotIn('route flush', out)
+
+    def test_present_policy_is_not_reinstalled(self):
+        out=self.run_sh('restore_policy', '''
+ip() {
+  case "$*" in
+    '-4 rule show pref 8920') printf '%s\\n' '8920: from all lookup 24680';;
+    *) printf 'IP %s\\n' "$*";;
+  esac
+}
+nft() { return 0; }
+ipv6_on() { return 1; }
+''')
+        self.assertEqual(out, '')
+
     def test_filter_has_no_native_source_blanket_accept(self):
         out=self.run_sh('render_firewall')
         self.assertIn('ct direction reply ct state established,related accept',out)
@@ -131,7 +160,7 @@ worker() {
 
     def test_version_does_not_install(self):
         r=subprocess.run(['/bin/sh',str(ROOT/'install.sh'),'--version'],text=True,capture_output=True,check=True)
-        self.assertEqual(r.stdout.strip(),'2.0.1')
+        self.assertEqual(r.stdout.strip(),'2.0.2')
 
     def test_failure_recovery_precedes_first_guard(self):
         self.assertLess(INSTALL.index('cat > "$RUNTIME.new"'),INSTALL.index('"$RUNTIME" guard'))

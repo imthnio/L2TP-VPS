@@ -1,7 +1,7 @@
 #!/bin/sh
 # L2TP-VPS installer; generated with tools/build.py. Download this file, then run sh.
 set -eu
-VERSION=2.0.1
+VERSION=2.0.2
 case "${1:-}" in --version) echo "$VERSION"; exit 0;; esac
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -320,6 +320,21 @@ EOF
   [ -s "$tmp/out/payload" ] || exit 1
   cat "$tmp/out/payload" > "$dest"
 )
+policy_missing() {
+  # nft can still be present after a reboot while the policy rules are gone.
+  nft list table inet l2tp_vps >/dev/null 2>&1 || return 0
+  ip -4 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
+  if ipv6_on; then
+    ip -6 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
+  fi
+  return 1
+}
+restore_policy() {
+  if policy_missing; then
+    guard
+    endpoint_route
+  fi
+}
 refresh() (
   # Serialize endpoint changes with upgrades; stale /run locks vanish on reboot.
   mkdir /run/l2tp-vps-refresh.lock 2>/dev/null || exit 0
@@ -351,7 +366,7 @@ watch() {
   while :; do
     sleep 60
     [ ! -f "$STATE/disabled" ] || continue
-    (load; refresh) || true
+    (load; refresh; restore_policy) || true
     # A late global IPv6 assignment must not depend on a 10-second polling window.
     peer_v6 "$PEER" '' '' '' '' "$TAG" || true
   done
@@ -422,6 +437,8 @@ recover() {
   legacy_routes
   restore_dns
   nft delete table inet l2tp_vps 2>/dev/null || true
+  rm -f /etc/systemd/networkd.conf.d/l2tp-vps.conf
+  rmdir /etc/systemd/networkd.conf.d 2>/dev/null || true
   printf '%s\n' '已恢复 VPS 原生出站。L2TP 和断线保护已关闭；账号和备份保留。重新运行安装命令可恢复隧道。'
 }
 uninstall() {
@@ -609,6 +626,8 @@ ConditionPathExists=!/etc/l2tp-vless/disabled
 [Service]
 Type=simple
 RuntimeDirectory=l2tp-vps
+# networkd removes policy rules it did not create. Install them again after it has finished.
+ExecStartPre=/usr/local/sbin/l2tp-vps guard
 ExecStartPre=/usr/local/sbin/l2tp-vps route
 ExecStart=/usr/sbin/xl2tpd -D -c /etc/l2tp-vless/xl2tpd.conf -p /run/l2tp-vps/xl2tpd.pid -C /run/l2tp-vps/control
 Restart=always
@@ -629,6 +648,12 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
+  # Default ManageForeignRoutingPolicyRules=yes deletes rules installed before the NIC is configured.
+  mkdir -p /etc/systemd/networkd.conf.d
+  cat > /etc/systemd/networkd.conf.d/l2tp-vps.conf <<'EOF'
+[Network]
+ManageForeignRoutingPolicyRules=no
+EOF
   systemctl daemon-reload
 else
   cat > /etc/init.d/l2tp-vps-guard <<'EOF'
@@ -646,7 +671,7 @@ supervisor="supervise-daemon"
 respawn_delay=10
 pidfile="/run/l2tp-vps/supervisor.pid"
 depend() { need net l2tp-vps-guard; }
-start_pre() { [ ! -f /etc/l2tp-vless/disabled ] && checkpath -d -m 0755 /run/l2tp-vps && /usr/local/sbin/l2tp-vps route; }
+start_pre() { [ ! -f /etc/l2tp-vless/disabled ] && checkpath -d -m 0755 /run/l2tp-vps && /usr/local/sbin/l2tp-vps guard && /usr/local/sbin/l2tp-vps route; }
 EOF
   cat > /etc/init.d/l2tp-vps-watch <<'EOF'
 #!/sbin/openrc-run
