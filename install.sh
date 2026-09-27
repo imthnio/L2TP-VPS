@@ -192,16 +192,16 @@ render_firewall() {
 add table inet l2tp_vps
 flush table inet l2tp_vps
 table inet l2tp_vps {
-  chain prerouting {
+  chain l2tp_in {
     type filter hook prerouting priority mangle; policy accept;
     ct direction reply meta mark set $MARK
   }
-  chain mark {
+  chain l2tp_route {
     type route hook output priority mangle; policy accept;
     ct direction reply meta mark set $MARK
     ct direction original meta mark set $TUNMARK
   }
-  chain postrouting {
+  chain l2tp_nat {
     type nat hook postrouting priority srcnat; policy accept;
     oifname "$PEER" masquerade
   }
