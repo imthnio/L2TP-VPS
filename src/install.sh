@@ -256,7 +256,7 @@ EOF
 }
 write_peer
 for hook in ip-up ip-down ipv6-up ipv6-down; do
-  case "$hook" in ip-up) op=up;; ip-down) op=down;; ipv6-up) op=v6-up;; ipv6-down) op=v6-down;; esac
+  case "$hook" in ip-up) op=up;; ip-down) op=down;; ipv6-up) op='v6-up';; ipv6-down) op='v6-down';; esac
   printf '#!/bin/sh\nexec /usr/local/sbin/l2tp-vps %s "$@"\n' "$op" > "/etc/ppp/$hook.d/10-l2tp-vps"
   chmod 700 "/etc/ppp/$hook.d/10-l2tp-vps"
   if [ "$INIT" = openrc ]; then
