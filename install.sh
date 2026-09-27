@@ -199,6 +199,11 @@ table inet l2tp_vps {
   chain l2tp_route {
     type route hook output priority mangle; policy accept;
     ct direction reply meta mark set $MARK
+    ip6 daddr fe80::/10 return
+    ip6 daddr ff00::/8 return
+    ip6 hoplimit 255 icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } return
+    udp sport 68 udp dport 67 return
+    udp sport 546 udp dport 547 return
     ct direction original meta mark set $TUNMARK
   }
   chain l2tp_nat {
