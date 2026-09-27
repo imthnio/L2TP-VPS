@@ -1,7 +1,7 @@
 #!/bin/sh
 # L2TP-VPS installer; generated with tools/build.py. Download this file, then run sh.
 set -eu
-VERSION=2.0.1
+VERSION=2.0.2
 case "${1:-}" in --version) echo "$VERSION"; exit 0;; esac
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -296,6 +296,8 @@ ConditionPathExists=!/etc/l2tp-vless/disabled
 [Service]
 Type=simple
 RuntimeDirectory=l2tp-vps
+# networkd removes policy rules it did not create. Install them again after it has finished.
+ExecStartPre=/usr/local/sbin/l2tp-vps guard
 ExecStartPre=/usr/local/sbin/l2tp-vps route
 ExecStart=/usr/sbin/xl2tpd -D -c /etc/l2tp-vless/xl2tpd.conf -p /run/l2tp-vps/xl2tpd.pid -C /run/l2tp-vps/control
 Restart=always
@@ -316,6 +318,12 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
+  # Default ManageForeignRoutingPolicyRules=yes deletes rules installed before the NIC is configured.
+  mkdir -p /etc/systemd/networkd.conf.d
+  cat > /etc/systemd/networkd.conf.d/l2tp-vps.conf <<'EOF'
+[Network]
+ManageForeignRoutingPolicyRules=no
+EOF
   systemctl daemon-reload
 else
   cat > /etc/init.d/l2tp-vps-guard <<'EOF'
@@ -333,7 +341,7 @@ supervisor="supervise-daemon"
 respawn_delay=10
 pidfile="/run/l2tp-vps/supervisor.pid"
 depend() { need net l2tp-vps-guard; }
-start_pre() { [ ! -f /etc/l2tp-vless/disabled ] && checkpath -d -m 0755 /run/l2tp-vps && /usr/local/sbin/l2tp-vps route; }
+start_pre() { [ ! -f /etc/l2tp-vless/disabled ] && checkpath -d -m 0755 /run/l2tp-vps && /usr/local/sbin/l2tp-vps guard && /usr/local/sbin/l2tp-vps route; }
 EOF
   cat > /etc/init.d/l2tp-vps-watch <<'EOF'
 #!/sbin/openrc-run
