@@ -75,17 +75,18 @@ drop_legacy_source_rules() {
   done < "$STATE/native-v6.txt"
 }
 copy_link_routes() {
-  # On-link destinations stay on the native NIC. Everything else hits the tunnel default.
+  # Keep the connected prefixes. The kernel's extra words (proto, metric, pref)
+  # are not accepted on replace, and a missing IPv6 prefix drops neighbor discovery.
   ip -4 route show table main dev "$NATIVE_IF" scope link 2>/dev/null | while IFS= read -r line; do
-    case "$line" in ''|default*) continue;; esac
-    # shellcheck disable=SC2086
-    ip -4 route replace $line table "$TABLE" 2>/dev/null || true
+    dest=${line%% *}
+    case "$dest" in ''|default*|broadcast|local|multicast|any|throw|prohibit|unreachable|blackhole) continue;; esac
+    ip -4 route replace "$dest" dev "$NATIVE_IF" scope link table "$TABLE" 2>/dev/null || true
   done
   if ipv6_on; then
     ip -6 route show table main dev "$NATIVE_IF" scope link 2>/dev/null | while IFS= read -r line; do
-      case "$line" in ''|default*) continue;; esac
-      # shellcheck disable=SC2086
-      ip -6 route replace $line table "$TABLE" 2>/dev/null || true
+      dest=${line%% *}
+      case "$dest" in ''|default*|any|multicast|throw|prohibit|unreachable|blackhole) continue;; esac
+      ip -6 route replace "$dest" dev "$NATIVE_IF" scope link table "$TABLE" 2>/dev/null || true
     done
   fi
 }
