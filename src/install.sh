@@ -360,13 +360,13 @@ fi
 info '恢复命令已准备好：sudo l2tp-vps recover'
 mkdir -p /etc/sysctl.d
 cat > /etc/sysctl.d/99-l2tp-vps.conf <<'EOF'
-net.ipv4.conf.all.rp_filter=2
-net.ipv4.conf.default.rp_filter=2
-net.ipv4.conf.all.src_valid_mark=1
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+net.ipv4.conf.all.src_valid_mark=0
 EOF
-sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null || true
-sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null || true
-sysctl -w net.ipv4.conf.all.src_valid_mark=1 >/dev/null || true
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null || true
+sysctl -w net.ipv4.conf.all.src_valid_mark=0 >/dev/null || true
 "$RUNTIME" guard
 "$RUNTIME" route
 # Resolve through the dedicated UID even when the old tunnel is down.

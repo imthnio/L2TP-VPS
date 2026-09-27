@@ -83,6 +83,10 @@ guard() {
   # nft submits the whole replacement as one atomic transaction.
   # Install the reply mark before removing the old "from native address" rule,
   # so an existing SSH session is not sent into the tunnel in between.
+  # Policy routing makes the reverse-path check drop replies from the public Internet.
+  for key in all default "$NATIVE_IF"; do
+    sysctl -w "net.ipv4.conf.$key.rp_filter=0" >/dev/null 2>&1 || true
+  done
   render_firewall | nft -f -
   copy_link_routes
   ip -4 route replace prohibit default metric 42700 table "$TABLE"
@@ -119,9 +123,9 @@ peer_up() {
   # Both the independent interface name AND pppd ipparam must match.
   [ "${1:-}" = "$PEER" ] && [ "${6:-}" = "$TAG" ] || return 0
   ip -4 route replace default dev "$PEER" metric 100 table "$TABLE"
-  sysctl -w "net.ipv4.conf.$PEER.rp_filter=2" >/dev/null || true
-  sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null || true
-  sysctl -w net.ipv4.conf.all.src_valid_mark=1 >/dev/null || true
+  sysctl -w "net.ipv4.conf.$PEER.rp_filter=0" >/dev/null || true
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null || true
+  sysctl -w net.ipv4.conf.all.src_valid_mark=0 >/dev/null || true
   peer_v6 "$@"
 }
 peer_v6() {
