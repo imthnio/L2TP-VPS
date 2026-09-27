@@ -1,7 +1,7 @@
 #!/bin/sh
 # L2TP-VPS installer; generated with tools/build.py. Download this file, then run sh.
 set -eu
-VERSION=2.0.2
+VERSION=2.0.3
 case "${1:-}" in --version) echo "$VERSION"; exit 0;; esac
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -128,7 +128,7 @@ modprobe ppp_generic 2>/dev/null || true
 if [ ! -f "$STATE/v2-owned" ]; then
   for family in -4 -6; do
     [ -z "$(ip "$family" route show table 24680 2>/dev/null)" ] || fatal '路由表 24680 已被其他软件使用'
-    for pref in 8900 8910 8911 8920; do
+    for pref in 8900 8905 8910 8911 8920 8930; do
       [ -z "$(ip "$family" rule show pref "$pref" 2>/dev/null)" ] || fatal "路由优先级 $pref 已被其他软件使用"
     done
   done
@@ -176,18 +176,32 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 STATE=/etc/l2tp-vless
 TABLE=24680
+MARK=0x24680
 PEER=l2tp-aa
 TAG=l2tp-vps
 fatal() { printf '%s\n' "$*" >&2; exit 1; }
 load() { [ -f "$STATE/v2-owned" ] || fatal '尚未安装新版'; . "$STATE/net.env"; }
 ipv6_on() { [ -e /proc/net/if_inet6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" != 1 ]; }
 render_firewall() {
-  # A source-policy exception is necessary for the initial lookup of SSH replies.
-  # This OUTPUT filter, not that exception, decides what may use the native NIC.
+  # Replies to connections that arrived here go back out the native NIC.
+  # Every other packet, including one bound to the native address, is routed
+  # into the tunnel and rewritten to the tunnel address.
   cat <<EOF
 add table inet l2tp_vps
 flush table inet l2tp_vps
 table inet l2tp_vps {
+  chain prerouting {
+    type filter hook prerouting priority mangle; policy accept;
+    ct direction reply meta mark set $MARK
+  }
+  chain mark {
+    type route hook output priority mangle; policy accept;
+    ct direction reply meta mark set $MARK
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "$PEER" masquerade
+  }
   chain output {
     type filter hook output priority 0; policy drop;
     oifname "lo" accept
@@ -210,27 +224,56 @@ rule() {
     ip "$family" rule add pref "$pref" "$@"
   fi
 }
+drop_legacy_source_rules() {
+  # Old builds sent every packet sourced from the VPS address out the native NIC.
+  [ -f "$STATE/native-v4.txt" ] || return 0
+  while IFS= read -r addr; do
+    [ -n "$addr" ] || continue
+    ip -4 rule del pref 8910 from "$addr/32" table main 2>/dev/null || true
+  done < "$STATE/native-v4.txt"
+  [ -f "$STATE/native-v6.txt" ] || return 0
+  while IFS= read -r addr; do
+    [ -n "$addr" ] || continue
+    ip -6 rule del pref 8910 from "$addr/128" table main 2>/dev/null || true
+  done < "$STATE/native-v6.txt"
+}
+copy_link_routes() {
+  # On-link destinations stay on the native NIC. Everything else hits the tunnel default.
+  ip -4 route show table main dev "$NATIVE_IF" scope link 2>/dev/null | while IFS= read -r line; do
+    case "$line" in ''|default*) continue;; esac
+    # shellcheck disable=SC2086
+    ip -4 route replace $line table "$TABLE" 2>/dev/null || true
+  done
+  if ipv6_on; then
+    ip -6 route show table main dev "$NATIVE_IF" scope link 2>/dev/null | while IFS= read -r line; do
+      case "$line" in ''|default*) continue;; esac
+      # shellcheck disable=SC2086
+      ip -6 route replace $line table "$TABLE" 2>/dev/null || true
+    done
+  fi
+}
 guard() {
   # nft submits the whole replacement as one atomic transaction.
+  # Install the reply mark before removing the old "from native address" rule,
+  # so an existing SSH session is not sent into the tunnel in between.
   render_firewall | nft -f -
+  copy_link_routes
   ip -4 route replace prohibit default metric 42700 table "$TABLE"
   rule -4 8900 "uidrange $FETCH_UID-$FETCH_UID lookup main" uidrange "$FETCH_UID-$FETCH_UID" table main
-  while IFS= read -r addr; do
-    [ -z "$addr" ] || rule -4 8910 "from $addr lookup main" from "$addr/32" table main
-  done < "$STATE/native-v4.txt"
+  rule -4 8905 "fwmark $MARK lookup main" fwmark "$MARK" table main
   rule -4 8920 "from all lookup $TABLE" table "$TABLE"
+  rule -4 8930 "blackhole" blackhole
   if ipv6_on; then
     ip -6 route replace prohibit default metric 42700 table "$TABLE"
     rule -6 8900 "uidrange $FETCH_UID-$FETCH_UID lookup main" uidrange "$FETCH_UID-$FETCH_UID" table main
-    while IFS= read -r addr; do
-      [ -n "$addr" ] || continue
-      rule -6 8910 "from $addr lookup main" from "$addr/128" table main
-    done < "$STATE/native-v6.txt"
+    rule -6 8905 "fwmark $MARK lookup main" fwmark "$MARK" table main
     # Neighbour discovery needs the native link while ordinary IPv6 stays closed.
     rule -6 8911 'to fe80::/10 lookup main' to fe80::/10 table main
     rule -6 8911 'to ff02::/16 lookup main' to ff02::/16 table main
     rule -6 8920 "from all lookup $TABLE" table "$TABLE"
+    rule -6 8930 "blackhole" blackhole
   fi
+  drop_legacy_source_rules
 }
 endpoint_route() {
   route=$(ip -4 route show default table main | awk -v nic="$NATIVE_IF" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==nic) {print; exit}}')
@@ -246,7 +289,9 @@ peer_up() {
   # Both the independent interface name AND pppd ipparam must match.
   [ "${1:-}" = "$PEER" ] && [ "${6:-}" = "$TAG" ] || return 0
   ip -4 route replace default dev "$PEER" metric 100 table "$TABLE"
-  sysctl -w "net.ipv4.conf.$PEER.rp_filter=2" >/dev/null
+  sysctl -w "net.ipv4.conf.$PEER.rp_filter=2" >/dev/null || true
+  sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null || true
+  sysctl -w net.ipv4.conf.all.src_valid_mark=1 >/dev/null || true
   peer_v6 "$@"
 }
 peer_v6() {
@@ -320,12 +365,34 @@ EOF
   [ -s "$tmp/out/payload" ] || exit 1
   cat "$tmp/out/payload" > "$dest"
 )
+legacy_source_rule() {
+  [ -f "$STATE/native-v4.txt" ] || return 1
+  while IFS= read -r addr; do
+    [ -n "$addr" ] || continue
+    if ip -4 rule show pref 8910 2>/dev/null | grep -F "from $addr" >/dev/null; then
+      return 0
+    fi
+  done < "$STATE/native-v4.txt"
+  [ -f "$STATE/native-v6.txt" ] || return 1
+  while IFS= read -r addr; do
+    [ -n "$addr" ] || continue
+    if ip -6 rule show pref 8910 2>/dev/null | grep -F "from $addr" >/dev/null; then
+      return 0
+    fi
+  done < "$STATE/native-v6.txt"
+  return 1
+}
 policy_missing() {
   # nft can still be present after a reboot while the policy rules are gone.
   nft list table inet l2tp_vps >/dev/null 2>&1 || return 0
+  legacy_source_rule && return 0
+  ip -4 rule show pref 8905 | grep -q "fwmark $MARK" || return 0
   ip -4 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
+  ip -4 rule show pref 8930 | grep -q blackhole || return 0
   if ipv6_on; then
+    ip -6 rule show pref 8905 | grep -q "fwmark $MARK" || return 0
     ip -6 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
+    ip -6 rule show pref 8930 | grep -q blackhole || return 0
   fi
   return 1
 }
@@ -362,11 +429,17 @@ refresh() (
     endpoint_route
   fi
 )
+ensure_peer_route() {
+  ip -4 addr show dev "$PEER" 2>/dev/null | grep -q 'inet ' || return 0
+  if ! ip -4 route show default table "$TABLE" | grep -q "dev $PEER"; then
+    peer_up "$PEER" '' '' '' '' "$TAG"
+  fi
+}
 watch() {
   while :; do
-    sleep 60
+    sleep 15
     [ ! -f "$STATE/disabled" ] || continue
-    (load; refresh; restore_policy) || true
+    (load; refresh; restore_policy; endpoint_route; ensure_peer_route) || true
     # A late global IPv6 assignment must not depend on a 10-second polling window.
     peer_v6 "$PEER" '' '' '' '' "$TAG" || true
   done
@@ -385,18 +458,21 @@ stop_services() {
 remove_routes() {
   # Full selectors are intentional. Never delete rules by priority alone.
   ip -4 rule del pref 8900 uidrange "$FETCH_UID-$FETCH_UID" table main 2>/dev/null || true
-  while IFS= read -r addr; do
-    [ -z "$addr" ] || ip -4 rule del pref 8910 from "$addr/32" table main 2>/dev/null || true
-  done < "$STATE/native-v4.txt"
+  ip -4 rule del pref 8905 fwmark "$MARK" table main 2>/dev/null || true
+  drop_legacy_source_rules
   ip -4 rule del pref 8920 table "$TABLE" 2>/dev/null || true
+  ip -4 rule del pref 8930 blackhole 2>/dev/null || true
   ip -6 rule del pref 8900 uidrange "$FETCH_UID-$FETCH_UID" table main 2>/dev/null || true
-  while IFS= read -r addr; do
-    [ -n "$addr" ] || continue
-    ip -6 rule del pref 8910 from "$addr/128" table main 2>/dev/null || true
-  done < "$STATE/native-v6.txt"
+  ip -6 rule del pref 8905 fwmark "$MARK" table main 2>/dev/null || true
   ip -6 rule del pref 8911 to fe80::/10 table main 2>/dev/null || true
   ip -6 rule del pref 8911 to ff02::/16 table main 2>/dev/null || true
   ip -6 rule del pref 8920 table "$TABLE" 2>/dev/null || true
+  ip -6 rule del pref 8930 blackhole 2>/dev/null || true
+  ip -4 route show table "$TABLE" dev "$NATIVE_IF" scope link 2>/dev/null | while IFS= read -r line; do
+    case "$line" in ''|default*|prohibit*) continue;; esac
+    # shellcheck disable=SC2086
+    ip -4 route del $line table "$TABLE" 2>/dev/null || true
+  done
   ip -4 route del prohibit default metric 42700 table "$TABLE" 2>/dev/null || true
   ip -6 route del prohibit default metric 42700 table "$TABLE" 2>/dev/null || true
   ip -4 route del "$ENDPOINT/32" table "$TABLE" 2>/dev/null || true
@@ -437,7 +513,7 @@ recover() {
   legacy_routes
   restore_dns
   nft delete table inet l2tp_vps 2>/dev/null || true
-  rm -f /etc/systemd/networkd.conf.d/l2tp-vps.conf
+  rm -f /etc/systemd/networkd.conf.d/l2tp-vps.conf /etc/sysctl.d/99-l2tp-vps.conf
   rmdir /etc/systemd/networkd.conf.d 2>/dev/null || true
   printf '%s\n' '已恢复 VPS 原生出站。L2TP 和断线保护已关闭；账号和备份保留。重新运行安装命令可恢复隧道。'
 }
@@ -483,6 +559,10 @@ status() {
   printf '版本：'; cat "$STATE/installed-version" 2>/dev/null || echo '未完成安装'
   printf '隧道：'; ip -4 -o addr show dev "$PEER" 2>/dev/null || true
   printf '出口路由：\n'; ip -4 route show table "$TABLE" 2>/dev/null || true
+  printf '策略规则：\n'
+  ip -4 rule show pref 8905 2>/dev/null || true
+  ip -4 rule show pref 8920 2>/dev/null || true
+  ip -4 rule show pref 8930 2>/dev/null || true
   printf '防火墙：\n'; nft list table inet l2tp_vps 2>/dev/null || true
 }
 # Tests source this file after removing ONLY this dispatch section.
@@ -653,6 +733,7 @@ EOF
   cat > /etc/systemd/networkd.conf.d/l2tp-vps.conf <<'EOF'
 [Network]
 ManageForeignRoutingPolicyRules=no
+ManageForeignRoutes=no
 EOF
   systemctl daemon-reload
 else
@@ -687,6 +768,15 @@ EOF
 fi
 
 info '恢复命令已准备好：sudo l2tp-vps recover'
+mkdir -p /etc/sysctl.d
+cat > /etc/sysctl.d/99-l2tp-vps.conf <<'EOF'
+net.ipv4.conf.all.rp_filter=2
+net.ipv4.conf.default.rp_filter=2
+net.ipv4.conf.all.src_valid_mark=1
+EOF
+sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null || true
+sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null || true
+sysctl -w net.ipv4.conf.all.src_valid_mark=1 >/dev/null || true
 "$RUNTIME" guard
 "$RUNTIME" route
 # Resolve through the dedicated UID even when the old tunnel is down.
@@ -773,13 +863,24 @@ peer_ip=$(ip -4 -o addr show dev "$PEER" | awk '{split($4,a,"/");print a[1];exit
 if [ -n "$route_src" ] && [ "$route_src" != "$peer_ip" ]; then
   fatal '出站源地址不是隧道地址；未标记升级成功'
 fi
-# A bound-native NEW connection must now fail even though SSH replies still work.
-if curl -4 --noproxy '*' --interface "$NATIVE_IP" -kfsS --connect-timeout 3 --max-time 5 https://1.1.1.1 >/dev/null 2>&1; then
-  fatal '原生出站隔离检查失败'
+# A socket bound to the VPS address is how most proxy nodes dial out.
+# It must leave through the tunnel and must not be visible as the native address.
+from_native=$(ip -4 route get 1.1.1.1 from "$NATIVE_IP" 2>/dev/null || true)
+printf '%s\n' "$from_native" | grep -q "dev $PEER" || fatal '绑定 VPS 原地址的连接没有走 L2TP；节点出口会仍是 VPS'
+bound=$(curl -4 --noproxy '*' --interface "$NATIVE_IP" -fsS --connect-timeout 10 --max-time 20 https://api.ipify.org || curl -4 --noproxy '*' --interface "$NATIVE_IP" -fsS --connect-timeout 10 --max-time 20 https://ifconfig.me || true)
+bound=$(printf '%s' "$bound" | tr -d '[:space:]')
+printf '%s\n' "$bound" | awk -F. 'NF!=4{exit 1}{for(i=1;i<=4;i++)if($i!~/^[0-9]+$/||$i>255)exit 1}' || fatal '绑定 VPS 原地址后无法经隧道访问外网'
+[ "$bound" != "$NATIVE_IP" ] || fatal '绑定 VPS 原地址的连接出口仍是 VPS'
+v6=$(awk 'NF {print; exit}' "$STATE/native-v6.txt" 2>/dev/null || true)
+if [ -n "$v6" ]; then
+  v6out=$(curl -6 --noproxy '*' --interface "$v6" -fsS --connect-timeout 3 --max-time 5 https://api64.ipify.org || true)
+  v6out=$(printf '%s' "$v6out" | tr -d '[:space:]')
+  [ "$v6out" != "$v6" ] || fatal 'IPv6 仍从 VPS 原生地址出去'
 fi
 printf '%s\n' "$VERSION" > "$STATE/installed-version"
 if [ -f "$0" ]; then cp "$0" "$STATE/install.sh"; chmod 600 "$STATE/install.sh"; fi
-SUCCESS=1
-info "安装/升级成功：${VERSION}；已验证公网出口 $out 与 PPP 地址一致"
+info "安装/升级成功：${VERSION}；公网出口 ${out}，不是 VPS 原生地址"
+info "本机新连接和节点出站都走 L2TP。SSH 与节点端口仍使用 VPS 原地址 ${NATIVE_IP}。"
 info '以后重复运行 README 安装命令，或运行 sudo l2tp-vps update，即可升级并保留账号。'
 info '状态：sudo l2tp-vps status；恢复原生网络：sudo l2tp-vps recover；卸载：sudo shanchu'
+SUCCESS=1

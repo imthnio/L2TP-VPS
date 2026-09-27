@@ -71,7 +71,6 @@ elif cmd=='systemctl':
  if ('stop' in args or '--now' in args) and 'l2tp-vps.service' in args:
   s['connected']=False;save()
 elif cmd=='curl':
- if '--interface' in args: sys.exit(7)
  print(s.get('public_ip') or '198.51.100.10')
 elif cmd=='chmod':
  for path in args[1:]: os.chmod(path,int(args[0],8))
@@ -122,7 +121,7 @@ class LifecycleTests(unittest.TestCase):
   self.install(first=False)
   self.assertEqual((state/'password').read_bytes(),password)
   self.assertTrue((state/'rollback-path').exists())
-  self.assertEqual((state/'installed-version').read_text().strip(),'2.0.2')
+  self.assertEqual((state/'installed-version').read_text().strip(),'2.0.3')
   self.assertTrue(self.model()['guard'])
   self.assertEqual((self.d/'etc/resolv.conf').read_text().splitlines()[0],'nameserver 1.1.1.1')
   options=(state/'options').read_text()
@@ -133,7 +132,9 @@ class LifecycleTests(unittest.TestCase):
   self.assertIn('refuse pap = yes\n',conf)
   unit=(self.d/'etc/systemd/system/l2tp-vps.service').read_text()
   self.assertLess(unit.index('l2tp-vps guard'), unit.index('l2tp-vps route'))
-  self.assertEqual((self.d/'etc/systemd/networkd.conf.d/l2tp-vps.conf').read_text().strip().splitlines()[-1],'ManageForeignRoutingPolicyRules=no')
+  netconf=(self.d/'etc/systemd/networkd.conf.d/l2tp-vps.conf').read_text()
+  self.assertIn('ManageForeignRoutingPolicyRules=no', netconf)
+  self.assertIn('ManageForeignRoutes=no', netconf)
   self.assertNotIn('A&A',unit)
   self.assertNotIn('A&A',first.stdout+first.stderr)
   self.assertNotIn('aa.net.uk',first.stdout+first.stderr)

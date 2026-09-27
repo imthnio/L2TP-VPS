@@ -1,7 +1,7 @@
 #!/bin/sh
 # L2TP-VPS installer; generated with tools/build.py. Download this file, then run sh.
 set -eu
-VERSION=2.0.2
+VERSION=2.0.3
 case "${1:-}" in --version) echo "$VERSION"; exit 0;; esac
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -128,7 +128,7 @@ modprobe ppp_generic 2>/dev/null || true
 if [ ! -f "$STATE/v2-owned" ]; then
   for family in -4 -6; do
     [ -z "$(ip "$family" route show table 24680 2>/dev/null)" ] || fatal '路由表 24680 已被其他软件使用'
-    for pref in 8900 8910 8911 8920; do
+    for pref in 8900 8905 8910 8911 8920 8930; do
       [ -z "$(ip "$family" rule show pref "$pref" 2>/dev/null)" ] || fatal "路由优先级 $pref 已被其他软件使用"
     done
   done
@@ -323,6 +323,7 @@ EOF
   cat > /etc/systemd/networkd.conf.d/l2tp-vps.conf <<'EOF'
 [Network]
 ManageForeignRoutingPolicyRules=no
+ManageForeignRoutes=no
 EOF
   systemctl daemon-reload
 else
@@ -357,6 +358,15 @@ EOF
 fi
 
 info '恢复命令已准备好：sudo l2tp-vps recover'
+mkdir -p /etc/sysctl.d
+cat > /etc/sysctl.d/99-l2tp-vps.conf <<'EOF'
+net.ipv4.conf.all.rp_filter=2
+net.ipv4.conf.default.rp_filter=2
+net.ipv4.conf.all.src_valid_mark=1
+EOF
+sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null || true
+sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null || true
+sysctl -w net.ipv4.conf.all.src_valid_mark=1 >/dev/null || true
 "$RUNTIME" guard
 "$RUNTIME" route
 # Resolve through the dedicated UID even when the old tunnel is down.
@@ -443,13 +453,24 @@ peer_ip=$(ip -4 -o addr show dev "$PEER" | awk '{split($4,a,"/");print a[1];exit
 if [ -n "$route_src" ] && [ "$route_src" != "$peer_ip" ]; then
   fatal '出站源地址不是隧道地址；未标记升级成功'
 fi
-# A bound-native NEW connection must now fail even though SSH replies still work.
-if curl -4 --noproxy '*' --interface "$NATIVE_IP" -kfsS --connect-timeout 3 --max-time 5 https://1.1.1.1 >/dev/null 2>&1; then
-  fatal '原生出站隔离检查失败'
+# A socket bound to the VPS address is how most proxy nodes dial out.
+# It must leave through the tunnel and must not be visible as the native address.
+from_native=$(ip -4 route get 1.1.1.1 from "$NATIVE_IP" 2>/dev/null || true)
+printf '%s\n' "$from_native" | grep -q "dev $PEER" || fatal '绑定 VPS 原地址的连接没有走 L2TP；节点出口会仍是 VPS'
+bound=$(curl -4 --noproxy '*' --interface "$NATIVE_IP" -fsS --connect-timeout 10 --max-time 20 https://api.ipify.org || curl -4 --noproxy '*' --interface "$NATIVE_IP" -fsS --connect-timeout 10 --max-time 20 https://ifconfig.me || true)
+bound=$(printf '%s' "$bound" | tr -d '[:space:]')
+printf '%s\n' "$bound" | awk -F. 'NF!=4{exit 1}{for(i=1;i<=4;i++)if($i!~/^[0-9]+$/||$i>255)exit 1}' || fatal '绑定 VPS 原地址后无法经隧道访问外网'
+[ "$bound" != "$NATIVE_IP" ] || fatal '绑定 VPS 原地址的连接出口仍是 VPS'
+v6=$(awk 'NF {print; exit}' "$STATE/native-v6.txt" 2>/dev/null || true)
+if [ -n "$v6" ]; then
+  v6out=$(curl -6 --noproxy '*' --interface "$v6" -fsS --connect-timeout 3 --max-time 5 https://api64.ipify.org || true)
+  v6out=$(printf '%s' "$v6out" | tr -d '[:space:]')
+  [ "$v6out" != "$v6" ] || fatal 'IPv6 仍从 VPS 原生地址出去'
 fi
 printf '%s\n' "$VERSION" > "$STATE/installed-version"
 if [ -f "$0" ]; then cp "$0" "$STATE/install.sh"; chmod 600 "$STATE/install.sh"; fi
-SUCCESS=1
-info "安装/升级成功：${VERSION}；已验证公网出口 $out 与 PPP 地址一致"
+info "安装/升级成功：${VERSION}；公网出口 ${out}，不是 VPS 原生地址"
+info "本机新连接和节点出站都走 L2TP。SSH 与节点端口仍使用 VPS 原地址 ${NATIVE_IP}。"
 info '以后重复运行 README 安装命令，或运行 sudo l2tp-vps update，即可升级并保留账号。'
 info '状态：sudo l2tp-vps status；恢复原生网络：sudo l2tp-vps recover；卸载：sudo shanchu'
+SUCCESS=1

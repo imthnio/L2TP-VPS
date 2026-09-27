@@ -93,7 +93,7 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         maintenance=ns(client,'setpriv','--reuid','65534','--regid','65534','--clear-groups','curl','--noproxy','*','-fsS','--max-time','2','http://203.0.113.1:443')
         assert maintenance.stdout=='192.0.2.10'
         curl(client,'http://203.0.113.1:443','--interface','192.0.2.10',okay=False)
-        print('PASS: offline IPv4/IPv6 fail closed; new bound-native connections blocked; incoming management replies and maintenance UID work')
+        print('PASS: offline IPv4/IPv6 fail closed; bound-native cannot use the VPS; incoming replies and maintenance UID work')
         # A veth named like our isolated peer simulates a point-to-point egress.
         run('ip','link','add','p'+suffix,'type','veth','peer','name','q'+suffix)
         run('ip','link','set','p'+suffix,'netns',client)
@@ -107,6 +107,9 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         # Weak-host ARP responds for 203.0.113.1, which stands in for the remote peer.
         runtime('peer_up l2tp-aa tty 0 198.18.0.1 198.18.0.2 l2tp-vps')
         assert curl(client,'http://203.0.113.1:18080')=='198.18.0.1'
+        assert curl(client,'http://203.0.113.1:18080','--interface','192.0.2.10')=='198.18.0.1'
+        curl(client,'http://[2001:db8:1::20]:18082','--interface','2001:db8:1::10',okay=False)
+        assert curl(server,'http://192.0.2.10:18081')=='192.0.2.20'
         runtime('peer_up ppp9 tty 0 1 2 foreign')
         assert curl(client,'http://203.0.113.1:18080')=='198.18.0.1'
         runtime('guard') # Idempotent refresh must preserve the active PPP route.
@@ -115,7 +118,7 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         curl(client,'http://203.0.113.1:18080',okay=False)
         curl(client,'http://203.0.113.1:18080','--interface','192.0.2.10',okay=False)
         assert curl(server,'http://192.0.2.10:18081')=='192.0.2.20'
-        print('PASS: online traffic uses tunnel; foreign PPP cannot replace it; hard interface loss does not fall back')
+        print('PASS: online and native-bound traffic use the tunnel; IPv6 does not leak; foreign PPP cannot replace it; hard interface loss does not fall back')
         ns(client,'ip','rule','add','pref','9000','from','198.51.100.99','table','main')
         ns(client,'ip','route','add','blackhole','198.51.100.0/24','table','100')
         runtime('remove_routes; nft delete table inet l2tp_vps')
