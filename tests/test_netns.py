@@ -15,7 +15,11 @@ if os.uname().sysname!='Linux' or os.geteuid()!=0:
     raise SystemExit('Requires Linux and root/CAP_NET_ADMIN (use the CI job)')
 
 def run(*args, check=True):
-    return subprocess.run(args,text=True,capture_output=True,check=check)
+    result = subprocess.run(args, text=True, capture_output=True)
+    if check and result.returncode:
+        raise AssertionError(
+            'command failed: ' + ' '.join(args) + '\nstdout:\n' + result.stdout + '\nstderr:\n' + result.stderr)
+    return result
 
 def ns(name,*args,check=True): return run('ip','netns','exec',name,*args,check=check)
 
