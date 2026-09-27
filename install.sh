@@ -245,20 +245,20 @@ drop_legacy_source_rules() {
     ip -6 rule del pref 8910 from "$addr/128" table main 2>/dev/null || true
   done < "$STATE/native-v6.txt"
 }
-copy_link_routes() {
-  # Keep the connected prefixes. The kernel's extra words (proto, metric, pref)
-  # are not accepted on replace, and a missing IPv6 prefix drops neighbor discovery.
-  ip -4 route show table main dev "$NATIVE_IF" scope link 2>/dev/null | while IFS= read -r line; do
+copy_dev_prefixes() {
+  # IPv6 connected prefixes are scope global. Copy only the prefix and device;
+  # proto, metric and pref from "ip route show" are rejected by route replace.
+  family=$1
+  ip "$family" route show table main dev "$NATIVE_IF" 2>/dev/null | while IFS= read -r line; do
     dest=${line%% *}
-    case "$dest" in ''|default*|broadcast|local|multicast|any|throw|prohibit|unreachable|blackhole) continue;; esac
-    ip -4 route replace "$dest" dev "$NATIVE_IF" scope link table "$TABLE" 2>/dev/null || true
+    case "$dest" in ''|default*|nexthop|broadcast|local|any|throw|prohibit|unreachable|blackhole) continue;; esac
+    ip "$family" route replace "$dest" dev "$NATIVE_IF" table "$TABLE" 2>/dev/null || true
   done
+}
+copy_link_routes() {
+  copy_dev_prefixes -4
   if ipv6_on; then
-    ip -6 route show table main dev "$NATIVE_IF" scope link 2>/dev/null | while IFS= read -r line; do
-      dest=${line%% *}
-      case "$dest" in ''|default*|any|multicast|throw|prohibit|unreachable|blackhole) continue;; esac
-      ip -6 route replace "$dest" dev "$NATIVE_IF" scope link table "$TABLE" 2>/dev/null || true
-    done
+    copy_dev_prefixes -6
   fi
 }
 guard() {
