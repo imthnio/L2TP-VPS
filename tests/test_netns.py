@@ -120,6 +120,30 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         assert curl(client,'http://203.0.113.1:18080')=='198.18.0.1'
         runtime('guard') # Idempotent refresh must preserve the active PPP route.
         assert curl(client,'http://203.0.113.1:18080')=='198.18.0.1'
+        # A Docker-style bridge: container NAT, a published port, and host-to-container access.
+        box='l2vp-k-'+suffix
+        run('ip','netns','add',box); created.append(box)
+        ns(client,'ip','link','add','docker0','type','bridge')
+        ns(client,'ip','addr','add','172.18.0.1/16','dev','docker0')
+        ns(client,'ip','link','set','docker0','up')
+        run('ip','link','add','b'+suffix,'type','veth','peer','name','k'+suffix)
+        run('ip','link','set','b'+suffix,'netns',client)
+        run('ip','link','set','k'+suffix,'netns',box)
+        ns(client,'ip','link','set','b'+suffix,'master','docker0','up')
+        ns(box,'ip','link','set','lo','up')
+        ns(box,'ip','addr','add','172.18.0.2/16','dev','k'+suffix)
+        ns(box,'ip','link','set','k'+suffix,'up')
+        ns(box,'ip','route','add','default','via','172.18.0.1')
+        ns(client,'sysctl','-qw','net.ipv4.ip_forward=1')
+        ns(client,'nft','add table ip dockersim; add chain ip dockersim post { type nat hook postrouting priority srcnat; }; add rule ip dockersim post ip saddr 172.18.0.0/16 oifname != "docker0" masquerade; add chain ip dockersim pre { type nat hook prerouting priority dstnat; }; add rule ip dockersim pre iifname "eth0" tcp dport 18085 dnat to 172.18.0.2:18084')
+        # Strict reverse-path check on the far side: a reply leaking into the tunnel is dropped.
+        ns(server,'sysctl','-qw','net.ipv4.conf.far-peer.rp_filter=1')
+        serve(box,'0.0.0.0',18084)
+        time.sleep(.4)
+        assert curl(box,'http://203.0.113.1:18080')=='198.18.0.1'
+        assert curl(client,'http://172.18.0.2:18084')=='172.18.0.1'
+        assert curl(server,'http://192.0.2.10:18085','--interface','203.0.113.1')=='203.0.113.1'
+        print('PASS: Docker bridge containers use the tunnel, published ports reply natively, host reaches containers')
         ns(client,'ip','link','delete','l2tp-aa') # Hard loss, without ip-down hook.
         curl(client,'http://203.0.113.1:18080',okay=False)
         curl(client,'http://203.0.113.1:18080','--interface','192.0.2.10',okay=False)
