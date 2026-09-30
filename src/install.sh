@@ -24,7 +24,7 @@ else
   command -v rc-service >/dev/null || fatal '需要 OpenRC'
 fi
 mkdir -p /run
-mkdir /run/l2tp-vps-install.lock 2>/dev/null || fatal '另一个安装/升级正在进行；若上次被强制终止，请重启后重试'
+mkdir /run/l2tp-vps-install.lock 2>/dev/null || fatal '另一个安装/升级正在进行。若确认上次已被强制终止，运行 sudo rmdir /run/l2tp-vps-install.lock 后重试（重启也会清掉）'
 finish() {
   rc=$?
   trap - EXIT INT TERM
@@ -132,7 +132,7 @@ modprobe ppp_generic 2>/dev/null || true
 if [ ! -f "$STATE/v2-owned" ]; then
   for family in -4 -6; do
     [ -z "$(ip "$family" route show table 24680 2>/dev/null)" ] || fatal '路由表 24680 已被其他软件使用'
-    for pref in 8900 8904 8905 8910 8911 8920 8930; do
+    for pref in 8900 8904 8905 8910 8911 8915 8920 8930; do
       [ -z "$(ip "$family" rule show pref "$pref" 2>/dev/null)" ] || fatal "路由优先级 $pref 已被其他软件使用"
     done
   done
