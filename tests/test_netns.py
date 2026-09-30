@@ -130,6 +130,8 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         runtime('remove_routes; nft delete table inet l2tp_vps')
         assert '198.51.100.99' in ns(client,'ip','rule','show','pref','9000').stdout
         assert '198.51.100.0/24' in ns(client,'ip','route','show','table','100').stdout
+        leftover=ns(client,'ip','-4','route','show','table','24680').stdout+ns(client,'ip','-6','route','show','table','24680').stdout
+        assert not leftover.strip(), 'routes left in table 24680:\n'+leftover
         assert curl(client,'http://203.0.113.1:18080')=='192.0.2.10'
         print('PASS: recovery restores native access and preserves unrelated rules/table 100')
     finally:

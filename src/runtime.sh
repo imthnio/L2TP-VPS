@@ -71,6 +71,8 @@ copy_dev_prefixes() {
   ip "$family" route show table main dev "$NATIVE_IF" 2>/dev/null | while IFS= read -r line; do
     dest=${line%% *}
     case "$dest" in ''|default*|nexthop|broadcast|local|any|throw|prohibit|unreachable|blackhole) continue;; esac
+    # A gatewayed route copied as "dev" only would become a wrong on-link route.
+    case "$line" in *" via "*) continue;; esac
     ip "$family" route replace "$dest" dev "$NATIVE_IF" table "$TABLE" 2>/dev/null || true
   done
 }
@@ -331,6 +333,11 @@ remove_routes() {
     case "$line" in ''|default*|prohibit*) continue;; esac
     # shellcheck disable=SC2086
     ip -4 route del $line table "$TABLE" 2>/dev/null || true
+  done
+  ip -6 route show table "$TABLE" dev "$NATIVE_IF" 2>/dev/null | while IFS= read -r line; do
+    dest=${line%% *}
+    case "$dest" in ''|default|prohibit) continue;; esac
+    ip -6 route del "$dest" dev "$NATIVE_IF" table "$TABLE" 2>/dev/null || true
   done
   ip -4 route del default metric 40000 table "$TABLE" 2>/dev/null || true
   ip -6 route del default metric 40000 table "$TABLE" 2>/dev/null || true
