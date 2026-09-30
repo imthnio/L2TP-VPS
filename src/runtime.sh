@@ -242,7 +242,7 @@ EOF
 fetch() (
   url=$1; dest=$2
   case "$url" in
-    https://raw.githubusercontent.com/imthnio/L2TP-VPS/*|https://api.github.com/repos/imthnio/L2TP-VPS/*|https://cdn.jsdelivr.net/gh/imthnio/L2TP-VPS@*) ;;
+    https://raw.githubusercontent.com/imthnio/L2TP-VPS/*|https://api.github.com/repos/imthnio/L2TP-VPS/*|https://cdn.jsdelivr.net/gh/imthnio/L2TP-VPS@*|https://github.com/imthnio/L2TP-VPS.git/info/refs?service=git-upload-pack) ;;
     *) fatal '更新下载仅允许本项目官方仓库地址';;
   esac
   case "$url" in *[!A-Za-z0-9:/._?=@%+-]* ) fatal '下载地址包含不支持的字符';; esac
@@ -438,6 +438,12 @@ restore_dns() {
       cp -a "$STATE/resolv.conf.before-v2" /etc/resolv.conf
     fi
   fi
+  # 删掉安装时补进 /etc/hosts 的那一行主机名（只认 "# l2tp-vps" 记号，其他行原样保留）。
+  if grep -q ' # l2tp-vps$' /etc/hosts 2>/dev/null; then
+    { grep -v ' # l2tp-vps$' /etc/hosts || true; } > /etc/hosts.l2tp-vps-new
+    cat /etc/hosts.l2tp-vps-new > /etc/hosts
+    rm -f /etc/hosts.l2tp-vps-new
+  fi
 }
 # recover：恢复 VPS 原生上网。先写 disabled 标记（开机服务看到它就不启动），停服务、删规则、还原 DNS。
 # 账号和备份都保留，重新运行安装命令即可再次启用隧道。
@@ -474,8 +480,16 @@ uninstall() {
 update() (
   tmp=$(mktemp -d /tmp/l2tp-update.XXXXXXXX)
   trap 'rm -rf "$tmp"' EXIT
-  fetch "https://api.github.com/repos/imthnio/L2TP-VPS/commits/main?cb=$(date +%s)" "$tmp/commit.json" || fatal '无法确认最新版本（网络错误或 GitHub API 限流），未安装缓存旧版'
-  commit=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$tmp/commit.json" | head -1)
+  commit=
+  if fetch "https://api.github.com/repos/imthnio/L2TP-VPS/commits/main?cb=$(date +%s)" "$tmp/commit.json"; then
+    commit=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$tmp/commit.json" | head -1)
+  fi
+  # GitHub API 对同一个 IP 每小时只给 60 次，共享 IP 的 NAT 小鸡很容易被限流（返回 403）。
+  # 这时改查 git 的引用列表（git clone 也用它），拿到的是同一个 main 提交号，没有这个次数限制。
+  if [ "${#commit}" != 40 ] && fetch "https://github.com/imthnio/L2TP-VPS.git/info/refs?service=git-upload-pack" "$tmp/refs"; then
+    commit=$(tr -d '\000' < "$tmp/refs" | sed -n 's/^[0-9a-f]\{4\}\([0-9a-f]\{40\}\) refs\/heads\/main$/\1/p' | head -1)
+  fi
+  [ -n "$commit" ] || fatal '无法确认最新版本（网络错误或 GitHub 限流），未安装缓存旧版'
   [ "${#commit}" = 40 ] || fatal 'GitHub 未返回有效提交'
   case "$commit" in *[!0-9a-f]*) fatal 'GitHub 未返回有效提交';; esac
   fetch "https://raw.githubusercontent.com/imthnio/L2TP-VPS/$commit/bootstrap.sh" "$tmp/bootstrap.sh" ||

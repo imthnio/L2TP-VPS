@@ -8,7 +8,7 @@
 if [ -f /usr/local/sbin/l2tp-vps ]; then if [ "$(id -u)" = 0 ]; then /usr/local/sbin/l2tp-vps update; else sudo /usr/local/sbin/l2tp-vps update; fi; else (set -eu; d=$(mktemp -d); trap 'rm -rf "$d"' EXIT; u="https://raw.githubusercontent.com/imthnio/L2TP-VPS/main/bootstrap.sh?cb=$(date +%s)"; if ! curl -4 --noproxy '*' -fsSL --connect-timeout 10 --max-time 45 "$u" -o "$d/start.sh"; then n=$(ip -4 route show default table main | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}'); a=$(ip -4 -o addr show dev "$n" scope global | awk 'NR==1{split($4,a,"/");print a[1]}'); j=$(curl -4 --noproxy '*' --interface "$a" -fsS --max-time 20 -H 'accept: application/dns-json' 'https://1.1.1.1/dns-query?name=raw.githubusercontent.com&type=A'); r=$(printf '%s' "$j" | tr ',' '\n' | sed -n 's/.*"data":[[:space:]]*"\([0-9.]*\)".*/\1/p' | head -1); [ -n "$r" ]; curl -4 --noproxy '*' --interface "$a" --resolve "raw.githubusercontent.com:443:$r" -fsSL --max-time 60 "$u" -o "$d/start.sh"; fi; sh -n "$d/start.sh"; sh "$d/start.sh"); fi
 ```
 
-下载入口先确认 GitHub `main` 的最新提交，再从该提交下载并校验安装器。GitHub Raw 失败时尝试 **同一个提交** 的 jsDelivr 文件，不使用可能过期的 `@main` 镜像。若 GitHub API 不可达或限流，明确报错，不把缓存旧版冒充最新版本。
+下载入口先确认 GitHub `main` 的最新提交，再从该提交下载并校验安装器。GitHub Raw 失败时尝试 **同一个提交** 的 jsDelivr 文件，不使用可能过期的 `@main` 镜像。GitHub API 限流（同一 IP 每小时 60 次，共享 IP 的 NAT 机器容易碰到）时，改用 git 引用列表确认同一个 `main` 提交；都不可达才明确报错，不把缓存旧版冒充最新版本。
 
 旧版保存的安装命令仍能在成功下载最新 `install.sh` 后进行升级。但旧命令的镜像可能缓存旧版，建议以后使用上面的新命令。
 

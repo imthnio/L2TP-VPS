@@ -93,6 +93,7 @@ class LifecycleTests(unittest.TestCase):
   for name in ['etc','run/systemd/system','usr/local/bin','usr/local/sbin','etc/ppp','etc/xl2tpd','etc/systemd/system','etc/init.d']:(self.d/name).mkdir(parents=True,exist_ok=True)
   (self.d/'etc/debian_version').write_text('12')
   (self.d/'etc/resolv.conf').write_text('nameserver 192.0.2.53\n')
+  (self.d/'etc/hosts').write_text('127.0.0.1 localhost\n')
   src=(ROOT/'install.sh').read_text()
   # Rewrite filesystem references only, never network data. Runtime heredoc is
   # also relocated, so generated commands operate under this temporary root.
@@ -143,7 +144,10 @@ class LifecycleTests(unittest.TestCase):
   self.install(okay=False)
   self.assertTrue(self.model()['guard'])
   self.assertFalse((self.d/'etc/l2tp-vless/installed-version').exists())
+  hosts=(self.d/'etc/hosts').read_text()
+  self.assertIn(' # l2tp-vps\n',hosts)
   r=self.runtime('recover');self.assertEqual(r.returncode,0,r.stderr)
+  self.assertEqual((self.d/'etc/hosts').read_text(),'127.0.0.1 localhost\n')
   self.assertFalse((self.d/'etc/systemd/networkd.conf.d/l2tp-vps.conf').exists())
   self.assertFalse(self.model()['guard'])
   self.assertFalse(self.model()['prohibit'])
