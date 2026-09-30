@@ -61,6 +61,7 @@ sudo env L2TP_SERVER=你的接入域名 /usr/local/sbin/l2tp-vps update
 ```sh
 python3 tools/build.py
 python3 tests/test_runtime.py
+python3 tests/test_lifecycle.py
 shellcheck -S warning install.sh bootstrap.sh src/runtime.sh
 sudo python3 tests/test_netns.py
 ```

@@ -32,7 +32,7 @@ elif cmd=='nslookup':
  if s.get('busybox_dns'): print('Server:    1.1.1.1\nAddress 1: 1.1.1.1 one.one.one.one\nName:    l2tp.example.net\nAddress 1: 198.51.100.1 l2tp.example.net')
  else: print('Name: l2tp.example.net\nAddress: 198.51.100.1')
 elif cmd=='timeout': sys.exit(subprocess.call(args[1:]))
-elif cmd=='su': sys.exit(subprocess.call(['/bin/sh',args[args.index('-c')+1]]))
+elif cmd=='su': sys.exit(subprocess.call(['/bin/sh','-c',args[args.index('-c')+1]]))
 elif cmd=='nft':
  if 'list' in args: sys.exit(0 if s.get('guard') else 1)
  elif 'delete' in args: s['guard']=False;save()
