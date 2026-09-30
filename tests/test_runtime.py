@@ -214,6 +214,16 @@ su() { printf 'SU %s\\n' "$*"; }
         self.assertNotIn('L2TP-VPS@main/install.sh',src)
         self.assertNotIn('/tmp/l2tp-vps-install.sh',src)
 
+    def test_commit_lookup_falls_back_to_git_refs(self):
+        refs = "001e# service=git-upload-pack\n0000015a" + "a"*40 + " HEAD\0multi_ack\n003d" + "b"*40 + " refs/heads/main\n0000"
+        for src in [RUNTIME, (ROOT/'bootstrap.sh').read_text()]:
+            self.assertIn('L2TP-VPS.git/info/refs?service=git-upload-pack', src)
+            line = [x for x in src.splitlines() if "refs\\/heads\\/main" in x][0]
+            cmd = line.split('commit=$(', 1)[1].rsplit(')', 1)[0].replace('"$tmp/refs"', '/dev/stdin')
+            r = subprocess.run(['/bin/sh', '-c', cmd], input=refs.encode(), capture_output=True, check=True)
+            self.assertEqual(r.stdout.decode().strip(), 'b'*40)
+        self.assertIn('https://github.com/imthnio/L2TP-VPS.git/info/refs?service=git-upload-pack)', RUNTIME)
+
     def test_update_pins_bootstrap_to_the_commit(self):
         src = RUNTIME
         self.assertIn('/commits/main?', src)

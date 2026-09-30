@@ -163,12 +163,24 @@ if [ "$need" = 1 ]; then
   fi
 fi
 for binary in curl ip nft xl2tpd pppd su nslookup timeout; do command -v "$binary" >/dev/null || fatal "缺少 $binary"; done
+# 用 apt 装 xl2tpd 时，系统自带的 xl2tpd 服务会被自动启动，没配任何连接却在公网监听 UDP 1701。
+# 本项目用自己独立的一份 xl2tpd，所以只把这个"没配置、白开着"的系统自带服务停掉并禁用；
+# 如果它的配置里写了任何 [lac]/[lns] 连接（说明有人在用），就完全不动。
+if [ "$INIT" = systemd ] && [ "$LEGACY" != 1 ] && [ -f /etc/xl2tpd/xl2tpd.conf ] && ! grep -Eq '^[[:space:]]*\[(lac|lns) ' /etc/xl2tpd/xl2tpd.conf; then
+  # 分两条命令：Debian 12/13 上 "disable --now" 停不掉这种由老式 init 脚本生成的服务。
+  systemctl stop xl2tpd.service >/dev/null 2>&1 || true
+  systemctl disable xl2tpd.service >/dev/null 2>&1 || true
+fi
 # PPP 拨号需要内核提供 /dev/ppp 设备。部分 OpenVZ/LXC 容器 VPS 没有开放，这种机器没法使用本脚本。
 modprobe ppp_generic 2>/dev/null || true
 [ -c /dev/ppp ] || mknod /dev/ppp c 108 0 2>/dev/null || true
 [ -c /dev/ppp ] || fatal 'VPS 不支持 PPP；需由商家启用 /dev/ppp'
 # 有些机器上 /dev/ppp 文件存在，但内核没有 PPP 驱动，一打开就失败，所以真的打开试一下。
-( : <>/dev/ppp ) 2>/dev/null || fatal 'VPS 不支持 PPP：/dev/ppp 无法打开（内核或容器没有开放 PPP）；需由商家启用'
+if ! ( : <>/dev/ppp ) 2>/dev/null; then
+  # Debian 云镜像（genericcloud）自带的精简版 cloud 内核根本没编译 PPP，换成普通内核就行。
+  case "$(uname -r)" in *-cloud-*) fatal 'VPS 不支持 PPP：当前是 Debian 精简版 cloud 内核，不带 PPP。先运行 sudo apt install linux-image-amd64，重启后再安装';; esac
+  fatal 'VPS 不支持 PPP：/dev/ppp 无法打开（内核或容器没有开放 PPP）；需由商家启用'
+fi
 # ---------- 第 4 步：第一次安装时确认没有和别的软件"撞车" ----------
 # 本项目要用：路由表 24680、若干条策略路由优先级、nftables 表 l2tp_vps、网卡名 l2tp-aa、系统用户 l2tp-fetch。
 # 第一次安装时如果发现它们已被别的软件占用，就停下来，绝不清空或覆盖别人的配置。
@@ -467,7 +479,7 @@ EOF
 fetch() (
   url=$1; dest=$2
   case "$url" in
-    https://raw.githubusercontent.com/imthnio/L2TP-VPS/*|https://api.github.com/repos/imthnio/L2TP-VPS/*|https://cdn.jsdelivr.net/gh/imthnio/L2TP-VPS@*) ;;
+    https://raw.githubusercontent.com/imthnio/L2TP-VPS/*|https://api.github.com/repos/imthnio/L2TP-VPS/*|https://cdn.jsdelivr.net/gh/imthnio/L2TP-VPS@*|https://github.com/imthnio/L2TP-VPS.git/info/refs?service=git-upload-pack) ;;
     *) fatal '更新下载仅允许本项目官方仓库地址';;
   esac
   case "$url" in *[!A-Za-z0-9:/._?=@%+-]* ) fatal '下载地址包含不支持的字符';; esac
@@ -663,6 +675,12 @@ restore_dns() {
       cp -a "$STATE/resolv.conf.before-v2" /etc/resolv.conf
     fi
   fi
+  # 删掉安装时补进 /etc/hosts 的那一行主机名（只认 "# l2tp-vps" 记号，其他行原样保留）。
+  if grep -q ' # l2tp-vps$' /etc/hosts 2>/dev/null; then
+    { grep -v ' # l2tp-vps$' /etc/hosts || true; } > /etc/hosts.l2tp-vps-new
+    cat /etc/hosts.l2tp-vps-new > /etc/hosts
+    rm -f /etc/hosts.l2tp-vps-new
+  fi
 }
 # recover：恢复 VPS 原生上网。先写 disabled 标记（开机服务看到它就不启动），停服务、删规则、还原 DNS。
 # 账号和备份都保留，重新运行安装命令即可再次启用隧道。
@@ -699,8 +717,16 @@ uninstall() {
 update() (
   tmp=$(mktemp -d /tmp/l2tp-update.XXXXXXXX)
   trap 'rm -rf "$tmp"' EXIT
-  fetch "https://api.github.com/repos/imthnio/L2TP-VPS/commits/main?cb=$(date +%s)" "$tmp/commit.json" || fatal '无法确认最新版本（网络错误或 GitHub API 限流），未安装缓存旧版'
-  commit=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$tmp/commit.json" | head -1)
+  commit=
+  if fetch "https://api.github.com/repos/imthnio/L2TP-VPS/commits/main?cb=$(date +%s)" "$tmp/commit.json"; then
+    commit=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$tmp/commit.json" | head -1)
+  fi
+  # GitHub API 对同一个 IP 每小时只给 60 次，共享 IP 的 NAT 小鸡很容易被限流（返回 403）。
+  # 这时改查 git 的引用列表（git clone 也用它），拿到的是同一个 main 提交号，没有这个次数限制。
+  if [ "${#commit}" != 40 ] && fetch "https://github.com/imthnio/L2TP-VPS.git/info/refs?service=git-upload-pack" "$tmp/refs"; then
+    commit=$(tr -d '\000' < "$tmp/refs" | sed -n 's/^[0-9a-f]\{4\}\([0-9a-f]\{40\}\) refs\/heads\/main$/\1/p' | head -1)
+  fi
+  [ -n "$commit" ] || fatal '无法确认最新版本（网络错误或 GitHub 限流），未安装缓存旧版'
   [ "${#commit}" = 40 ] || fatal 'GitHub 未返回有效提交'
   case "$commit" in *[!0-9a-f]*) fatal 'GitHub 未返回有效提交';; esac
   fetch "https://raw.githubusercontent.com/imthnio/L2TP-VPS/$commit/bootstrap.sh" "$tmp/bootstrap.sh" ||
@@ -1023,6 +1049,19 @@ if [ "$(readlink /etc/resolv.conf 2>/dev/null || true)" != /etc/l2tp-vps-resolv.
   ln -s /etc/l2tp-vps-resolv.conf /etc/resolv.conf.l2tp-vps-new
   mv -f /etc/resolv.conf.l2tp-vps-new /etc/resolv.conf
 fi
+# Ubuntu 云镜像的 /etc/hosts 里没有本机主机名，以前全靠 systemd-resolved（127.0.0.53）顺带解析。
+# 换成 1.1.1.1 以后主机名就查不到了：每次 sudo 都会报 "unable to resolve host"，隧道断开时还要卡几秒，
+# 主机名也会被发到公网 DNS。所以系统没有 myhostname 兜底、/etc/hosts 里也没有它时，补一行 127.0.1.1
+# （Debian 系的惯例写法），末尾带 "# l2tp-vps" 记号；recover / 卸载时只删这一行。
+host_name=$(hostname 2>/dev/null || true)
+case "$host_name" in
+  ''|*[!A-Za-z0-9.-]*) ;;
+  *)
+    if ! grep -Eq '^hosts:.*myhostname' /etc/nsswitch.conf 2>/dev/null &&
+       ! awk -v h="$host_name" '$1 !~ /^#/ {for(i=2;i<=NF;i++){if($i ~ /^#/)break; if($i==h)f=1}} END{exit !f}' /etc/hosts 2>/dev/null; then
+      printf '127.0.1.1 %s # l2tp-vps\n' "$host_name" >> /etc/hosts
+    fi;;
+esac
 # ---------- 第 16 步：启动服务并开始拨号 ----------
 # 删除 disabled 标记（执行 recover 时留下的），设置开机启动并重启三个服务。升级时隧道会短暂中断。
 rm -f "$STATE/disabled"

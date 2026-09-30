@@ -38,8 +38,16 @@ fetch() {
   [ -n "$resolved" ] || return 1
   curl -4 --noproxy '*' --interface "$addr" --resolve "$host:443:$resolved" --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 10 --max-time 60 --retry 1 -o "$dest" "$url"
 }
-fetch "https://api.github.com/repos/imthnio/L2TP-VPS/commits/main?cb=$(date +%s)" "$tmp/commit.json" || { echo '无法确认最新版本（网络错误或 GitHub API 限流），未安装缓存旧版' >&2; exit 1; }
-commit=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$tmp/commit.json" | head -1)
+commit=
+if fetch "https://api.github.com/repos/imthnio/L2TP-VPS/commits/main?cb=$(date +%s)" "$tmp/commit.json"; then
+  commit=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$tmp/commit.json" | head -1)
+fi
+# GitHub API 对同一个 IP 每小时只给 60 次，共享 IP 的 NAT 小鸡很容易被限流（返回 403）。
+# 这时改查 git 的引用列表（git clone 也用它），拿到的是同一个 main 提交号，没有这个次数限制。
+if [ "${#commit}" != 40 ] && fetch "https://github.com/imthnio/L2TP-VPS.git/info/refs?service=git-upload-pack" "$tmp/refs"; then
+  commit=$(tr -d '\000' < "$tmp/refs" | sed -n 's/^[0-9a-f]\{4\}\([0-9a-f]\{40\}\) refs\/heads\/main$/\1/p' | head -1)
+fi
+[ -n "$commit" ] || { echo '无法确认最新版本（网络错误或 GitHub 限流），未安装缓存旧版' >&2; exit 1; }
 [ "${#commit}" = 40 ] || { echo 'GitHub 未返回有效提交' >&2; exit 1; }
 case "$commit" in *[!0-9a-f]*) exit 1;; esac
 for file in install.sh SHA256SUMS; do
