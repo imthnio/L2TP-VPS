@@ -118,7 +118,7 @@ if [ "$need" = 1 ]; then
     export DEBIAN_FRONTEND=noninteractive
     # A broken third-party source must not abort before the official packages are tried.
     apt-get -o DPkg::Lock::Timeout=120 update || info 'apt-get update 有报错（常见于失效的第三方源），继续尝试安装依赖'
-    apt-get -o DPkg::Lock::Timeout=120 install -y curl ca-certificates iproute2 nftables xl2tpd ppp dnsutils || fatal '依赖安装失败；尚未切换网络。请先修复 apt 软件源后重试'
+    apt-get -o DPkg::Lock::Timeout=120 install -y curl ca-certificates iproute2 nftables xl2tpd ppp dnsutils || fatal '依赖安装失败；尚未切换网络。请先修复 apt 软件源后重试（Ubuntu 的 xl2tpd 在 universe 源，可先运行 add-apt-repository universe）'
     unset DEBIAN_FRONTEND
   fi
 fi

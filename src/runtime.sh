@@ -306,6 +306,8 @@ watch() {
 stop_services() {
   if [ "$INIT" = systemd ]; then
     systemctl disable --now l2tp-vps-watch.service l2tp-vps.service l2tp-vps-guard.service 2>/dev/null || true
+    # xl2tpd exits 1 on SIGTERM; do not leave a stopped service marked "failed".
+    systemctl reset-failed l2tp-vps-watch.service l2tp-vps.service l2tp-vps-guard.service 2>/dev/null || true
   else
     for s in l2tp-vps-watch l2tp-vps l2tp-vps-guard; do
       rc-service "$s" stop 2>/dev/null || true
@@ -393,6 +395,8 @@ uninstall() {
   rm -f /etc/systemd/system/l2tp-vps.service /etc/systemd/system/l2tp-vps-watch.service /etc/systemd/system/l2tp-vps-guard.service
   rm -f /etc/init.d/l2tp-vps /etc/init.d/l2tp-vps-watch /etc/init.d/l2tp-vps-guard
   [ "$INIT" != systemd ] || systemctl daemon-reload
+  # restore_dns has put the original resolv.conf back; drop our copy unless still linked.
+  [ "$(readlink /etc/resolv.conf 2>/dev/null || true)" = /etc/l2tp-vps-resolv.conf ] || rm -f /etc/l2tp-vps-resolv.conf
   # Keep dependencies: ownership of distro packages cannot be safely inferred.
   # Keep root-only backups and the state for offline recovery and reinstallation.
   rm -f "$STATE/installed-version"
