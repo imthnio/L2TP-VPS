@@ -25,6 +25,11 @@ table inet l2tp_vps {
     type route hook output priority 300; policy accept;
     ct direction reply meta mark set $MARK
   }
+  chain l2tp_bridge {
+    # Replies forwarded from Docker bridges, wg0 etc. go back the way they came in.
+    type filter hook prerouting priority mangle; policy accept;
+    iifname != { "lo", "$NATIVE_IF", "$PEER" } ct direction reply meta mark set $MARK
+  }
   chain l2tp_nat {
     type nat hook postrouting priority srcnat; policy accept;
     oifname "$PEER" masquerade
@@ -33,6 +38,8 @@ table inet l2tp_vps {
     type filter hook output priority 0; policy drop;
     oifname "lo" accept
     oifname "$PEER" accept
+    # Other local interfaces (Docker bridges, private NICs, wg0) are not the native exit.
+    oifname != "$NATIVE_IF" accept
     oifname "$NATIVE_IF" ct direction reply ct state established,related accept
     oifname "$NATIVE_IF" ip daddr $ENDPOINT udp dport 1701 accept
     oifname "$NATIVE_IF" meta skuid $FETCH_UID udp dport 53 accept
@@ -114,6 +121,8 @@ guard() {
   # 8904 is after the maintenance UID rule and before any leftover "from native address" rule.
   rule -4 8904 "fwmark $TUNMARK lookup $TABLE" fwmark "$TUNMARK" table "$TABLE"
   rule -4 8905 "fwmark $MARK lookup main" fwmark "$MARK" table main
+  # Specific main-table routes (Docker bridges, private LANs) win; default routes do not.
+  rule -4 8915 "lookup main suppress_prefixlength 0" table main suppress_prefixlength 0
   rule -4 8920 "from all lookup $TABLE" table "$TABLE"
   rule -4 8930 "blackhole" blackhole
   if ipv6_on; then
@@ -125,6 +134,7 @@ guard() {
     # Neighbour discovery needs the native link while ordinary IPv6 stays closed.
     rule -6 8911 'to fe80::/10 lookup main' to fe80::/10 table main
     rule -6 8911 'to ff02::/16 lookup main' to ff02::/16 table main
+    rule -6 8915 "lookup main suppress_prefixlength 0" table main suppress_prefixlength 0
     rule -6 8920 "from all lookup $TABLE" table "$TABLE"
     rule -6 8930 "blackhole" blackhole
   fi
@@ -245,11 +255,13 @@ policy_missing() {
   legacy_source_rule && return 0
   ip -4 rule show pref 8904 | grep -q "fwmark $TUNMARK" || return 0
   ip -4 rule show pref 8905 | grep -q "fwmark $MARK" || return 0
+  ip -4 rule show pref 8915 | grep -q suppress_prefixlength || return 0
   ip -4 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
   ip -4 rule show pref 8930 | grep -q blackhole || return 0
   if ipv6_on; then
     ip -6 rule show pref 8904 | grep -q "fwmark $TUNMARK" || return 0
     ip -6 rule show pref 8905 | grep -q "fwmark $MARK" || return 0
+    ip -6 rule show pref 8915 | grep -q suppress_prefixlength || return 0
     ip -6 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
     ip -6 rule show pref 8930 | grep -q blackhole || return 0
   fi
@@ -295,9 +307,15 @@ ensure_peer_route() {
   fi
 }
 watch() {
+  tick=0
   while :; do
-    sleep 15
+    sleep 3
     [ ! -f "$STATE/disabled" ] || continue
+    tick=$((tick + 3))
+    # "nft flush ruleset" (e.g. restarting nftables.service) removes the guard. While the
+    # tunnel is down that opens native egress, so check for it every 3 seconds.
+    if [ "$tick" -lt 15 ] && nft list table inet l2tp_vps >/dev/null 2>&1; then continue; fi
+    tick=0
     (load; refresh; restore_policy; endpoint_route; ensure_peer_route) || true
     # A late global IPv6 assignment must not depend on a 10-second polling window.
     peer_v6 "$PEER" '' '' '' '' "$TAG" || true
@@ -322,6 +340,7 @@ remove_routes() {
   ip -4 rule del pref 8904 fwmark "$TUNMARK" table "$TABLE" 2>/dev/null || true
   ip -4 rule del pref 8905 fwmark "$MARK" table main 2>/dev/null || true
   drop_legacy_source_rules
+  ip -4 rule del pref 8915 table main suppress_prefixlength 0 2>/dev/null || true
   ip -4 rule del pref 8920 table "$TABLE" 2>/dev/null || true
   ip -4 rule del pref 8930 blackhole 2>/dev/null || true
   ip -6 rule del pref 8900 uidrange "$FETCH_UID-$FETCH_UID" table main 2>/dev/null || true
@@ -329,6 +348,7 @@ remove_routes() {
   ip -6 rule del pref 8905 fwmark "$MARK" table main 2>/dev/null || true
   ip -6 rule del pref 8911 to fe80::/10 table main 2>/dev/null || true
   ip -6 rule del pref 8911 to ff02::/16 table main 2>/dev/null || true
+  ip -6 rule del pref 8915 table main suppress_prefixlength 0 2>/dev/null || true
   ip -6 rule del pref 8920 table "$TABLE" 2>/dev/null || true
   ip -6 rule del pref 8930 blackhole 2>/dev/null || true
   ip -4 route show table "$TABLE" dev "$NATIVE_IF" scope link 2>/dev/null | while IFS= read -r line; do

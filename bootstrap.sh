@@ -2,7 +2,10 @@
 # L2TP-VPS bootstrap: resolve main once, then fetch only that immutable commit.
 set -eu
 umask 077
-[ "$(id -u)" = 0 ] || exec sudo sh "$0" "$@"
+if [ "$(id -u)" != 0 ]; then
+  command -v sudo >/dev/null 2>&1 || { echo '需要 root 权限：本机没有 sudo，请先 su - 切换到 root 再运行' >&2; exit 1; }
+  exec sudo sh "$0" "$@"
+fi
 tmp=$(mktemp -d /tmp/l2tp-bootstrap.XXXXXXXX)
 trap 'rm -rf "$tmp"' EXIT
 trap 'exit 130' INT

@@ -83,6 +83,7 @@ ip() {
   case "$*" in
     '-4 rule show pref 8904') printf '%s\\n' '8904: from all fwmark 0x24681 lookup 24680';;
     '-4 rule show pref 8905') printf '%s\\n' '8905: from all fwmark 0x24680 lookup main';;
+    '-4 rule show pref 8915') printf '%s\\n' '8915: from all lookup main suppress_prefixlength 0';;
     '-4 rule show pref 8920') printf '%s\\n' '8920: from all lookup 24680';;
     '-4 rule show pref 8930') printf '%s\\n' '8930: from all blackhole';;
     '-4 rule show pref 8910') ;;
