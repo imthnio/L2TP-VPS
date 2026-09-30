@@ -116,8 +116,9 @@ if [ "$need" = 1 ]; then
     apk add --no-cache curl ca-certificates iproute2 nftables xl2tpd ppp bind-tools || fatal '依赖安装失败；尚未切换网络'
   else
     export DEBIAN_FRONTEND=noninteractive
-    apt-get -o DPkg::Lock::Timeout=120 update
-    apt-get -o DPkg::Lock::Timeout=120 install -y curl ca-certificates iproute2 nftables xl2tpd ppp dnsutils
+    # A broken third-party source must not abort before the official packages are tried.
+    apt-get -o DPkg::Lock::Timeout=120 update || info 'apt-get update 有报错（常见于失效的第三方源），继续尝试安装依赖'
+    apt-get -o DPkg::Lock::Timeout=120 install -y curl ca-certificates iproute2 nftables xl2tpd ppp dnsutils || fatal '依赖安装失败；尚未切换网络。请先修复 apt 软件源后重试'
     unset DEBIAN_FRONTEND
   fi
 fi
@@ -125,6 +126,8 @@ for binary in curl ip nft xl2tpd pppd su nslookup timeout; do command -v "$binar
 modprobe ppp_generic 2>/dev/null || true
 [ -c /dev/ppp ] || mknod /dev/ppp c 108 0 2>/dev/null || true
 [ -c /dev/ppp ] || fatal 'VPS 不支持 PPP；需由商家启用 /dev/ppp'
+# A node can exist while the kernel has no PPP driver (open fails with ENXIO).
+( : <>/dev/ppp ) 2>/dev/null || fatal 'VPS 不支持 PPP：/dev/ppp 无法打开（内核或容器没有开放 PPP）；需由商家启用'
 # Reserve only an unused namespace on first migration; never flush somebody else's table.
 if [ ! -f "$STATE/v2-owned" ]; then
   for family in -4 -6; do
@@ -339,7 +342,8 @@ service() {
 # has native DNS/HTTPS access; ordinary root/apps have NO such exception.
 worker() {
   task=$1
-  su -s /bin/sh -c "$task" l2tp-fetch
+  # Run through sh: /tmp is often mounted noexec on hardened VPS images.
+  su -s /bin/sh -c "/bin/sh $task" l2tp-fetch
 }
 resolve() {
   case "$SERVER" in *[!0-9.]* ) ;; *) printf '%s\n' "$SERVER"; return;; esac

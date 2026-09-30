@@ -196,6 +196,15 @@ worker() {
         self.assertLess(INSTALL.index('> /usr/local/bin/shanchu'),INSTALL.index('"$RUNTIME" guard'))
         self.assertLess(INSTALL.index('> "$STATE/password"'),INSTALL.index('"$RUNTIME" guard'))
 
+    def test_unusable_ppp_device_fails_before_guard(self):
+        self.assertLess(INSTALL.index('( : <>/dev/ppp )'),INSTALL.index('"$RUNTIME" guard'))
+
+    def test_worker_does_not_need_exec_permission_on_tmp(self):
+        out=self.run_sh('worker /tmp/l2tp-x/worker', '''
+su() { printf 'SU %s\\n' "$*"; }
+''')
+        self.assertIn('-c /bin/sh /tmp/l2tp-x/worker l2tp-fetch', out)
+
     def test_bootstrap_uses_immutable_revision_and_checksum(self):
         src=(ROOT/'bootstrap.sh').read_text()
         self.assertIn('/commits/main?',src)

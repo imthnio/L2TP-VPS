@@ -167,7 +167,8 @@ service() {
 # has native DNS/HTTPS access; ordinary root/apps have NO such exception.
 worker() {
   task=$1
-  su -s /bin/sh -c "$task" l2tp-fetch
+  # Run through sh: /tmp is often mounted noexec on hardened VPS images.
+  su -s /bin/sh -c "/bin/sh $task" l2tp-fetch
 }
 resolve() {
   case "$SERVER" in *[!0-9.]* ) ;; *) printf '%s\n' "$SERVER"; return;; esac
