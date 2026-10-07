@@ -288,12 +288,15 @@ policy_missing() {
   # policy_missing：检查保护是否完整。防火墙表还在，但策略规则被 networkd 等程序删掉的情况也要发现。
   nft list table inet l2tp_vps >/dev/null 2>&1 || return 0
   legacy_source_rule && return 0
+  # 8900 丢了时维护账号走不了原生网络，隧道断开后就没法重新解析域名，也没法升级。
+  ip -4 rule show pref 8900 | grep -q "uidrange $FETCH_UID-$FETCH_UID" || return 0
   ip -4 rule show pref 8904 | grep -q "fwmark $TUNMARK" || return 0
   ip -4 rule show pref 8905 | grep -q "fwmark $MARK" || return 0
   ip -4 rule show pref 8915 | grep -q suppress_prefixlength || return 0
   ip -4 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
   ip -4 rule show pref 8930 | grep -q blackhole || return 0
   if ipv6_on; then
+    ip -6 rule show pref 8900 | grep -q "uidrange $FETCH_UID-$FETCH_UID" || return 0
     ip -6 rule show pref 8904 | grep -q "fwmark $TUNMARK" || return 0
     ip -6 rule show pref 8905 | grep -q "fwmark $MARK" || return 0
     ip -6 rule show pref 8915 | grep -q suppress_prefixlength || return 0
@@ -314,6 +317,9 @@ refresh() (
   # 用 /run 下的目录当锁，避免和正在进行的安装/升级同时改配置；重启后锁自动消失。
   mkdir /run/l2tp-vps-refresh.lock 2>/dev/null || exit 0
   trap 'rmdir /run/l2tp-vps-refresh.lock' EXIT
+  # 服务被停止/重启时会收到 TERM；不接住的话 EXIT 不会执行，锁会一直留到重启，域名就再也不会重新解析。
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   [ ! -d /run/l2tp-vps-install.lock ] || exit 0
   if ip -4 addr show dev "$PEER" 2>/dev/null | grep -q 'inet '; then
     exit 0
@@ -347,6 +353,8 @@ ensure_peer_route() {
 # watch：l2tp-vps-watch 服务运行的后台巡检循环。
 watch() {
   tick=0
+  # 只有这个巡检会长期调用 refresh。上一个巡检进程如果被强杀，锁会残留，启动时先清掉。
+  rmdir /run/l2tp-vps-refresh.lock 2>/dev/null || true
   while :; do
     sleep 3
     [ ! -f "$STATE/disabled" ] || continue
@@ -526,8 +534,10 @@ status() {
 # 下面按第一个参数执行对应功能（不带参数等于 status）。测试会删掉 BEGIN DISPATCH 之后的部分再加载本文件。
 # BEGIN DISPATCH
 [ "$(id -u)" = 0 ] || fatal '请用 root 或 sudo 运行'
-load
 cmd=${1:-status}; shift || true
+# 第一次安装如果在写入配置之前就失败，机器上只有 l2tp-vps 而没有 v2-owned，README 的命令会走到 update。
+# 这时网络还没被改动，update 也不需要读配置，直接重新走一遍安装入口；否则会一直报"尚未安装新版"。
+if [ "$cmd" != update ] || [ -f "$STATE/v2-owned" ]; then load; fi
 case "$cmd" in
   legacy-cleanup) legacy_routes;;
   guard) guard;; route) endpoint_route;;

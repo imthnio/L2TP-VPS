@@ -22,7 +22,7 @@
 set -eu
 # SSH 断开时终端会发 HUP 信号，这里忽略它，避免安装做到一半被打断。
 trap '' HUP
-VERSION=2.0.5
+VERSION=2.0.6
 case "${1:-}" in --version) echo "$VERSION"; exit 0;; esac
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -86,7 +86,8 @@ elif [ "$LEGACY" = 1 ]; then
   # 旧版把密码写在 /etc/ppp/chap-secrets 里。只按旧版自己写出的格式解析；只要有一点歧义就报错，
   # 宁可让用户手动提供密码，也不猜错。
   if [ -z "${L2TP_PASS:-}" ]; then
-  old_pass=$(awk -v user="${L2TP_USER:-$old_user}" '
+  # 用户名经环境变量交给 awk：awk -v 会把用户名里的反斜杠当转义符吃掉（如 DOMAIN\user）。
+  old_pass=$(L2TP_MATCH_USER="${L2TP_USER:-$old_user}" awk '
     function token(    c,s,quoted) {
       sub(/^[ \t]+/, "", line); s=""; quoted=(substr(line,1,1)=="\""); if(quoted)line=substr(line,2);
       while(length(line)) { c=substr(line,1,1); line=substr(line,2);
@@ -96,9 +97,18 @@ elif [ "$LEGACY" = 1 ]; then
         else s=s c;
       } if(quoted)exit 2; return s
     }
+    BEGIN {user=ENVIRON["L2TP_MATCH_USER"]}
     {line=$0; u=token(); server=token(); password=token(); if(u==user && server=="*"){print password; found++;}}
     END {if(found!=1)exit 2}' /etc/ppp/chap-secrets 2>/dev/null) || fatal '无法无歧义读取旧密码；请用 L2TP_USER/L2TP_PASS 环境变量明确提供账号，或先保留旧配置联系维护者'
   fi
+fi
+# 上次安装没成功（比如密码填错，一直拨不通）时，再运行安装命令会沿用保存的错误账号。
+# 有终端、又没用环境变量指定账号时，给一次重新输入的机会；直接回车仍沿用原账号。
+if [ -f "$STATE/password" ] && [ ! -f "$STATE/installed-version" ] && [ -t 0 ] &&
+   [ -z "${L2TP_SERVER:-}${L2TP_USER:-}${L2TP_PASS:-}" ]; then
+  printf '上次安装没有完成。要重新输入服务器、用户名和密码吗？[y/N] '
+  IFS= read -r redo || redo=
+  case "$redo" in y|Y|yes|YES) old_server=; old_user=; old_pass=;; esac
 fi
 # 环境变量 L2TP_SERVER / L2TP_USER / L2TP_PASS 优先；没给就用旧配置里的值。
 SERVER=${L2TP_SERVER:-$old_server}
@@ -525,12 +535,15 @@ policy_missing() {
   # policy_missing：检查保护是否完整。防火墙表还在，但策略规则被 networkd 等程序删掉的情况也要发现。
   nft list table inet l2tp_vps >/dev/null 2>&1 || return 0
   legacy_source_rule && return 0
+  # 8900 丢了时维护账号走不了原生网络，隧道断开后就没法重新解析域名，也没法升级。
+  ip -4 rule show pref 8900 | grep -q "uidrange $FETCH_UID-$FETCH_UID" || return 0
   ip -4 rule show pref 8904 | grep -q "fwmark $TUNMARK" || return 0
   ip -4 rule show pref 8905 | grep -q "fwmark $MARK" || return 0
   ip -4 rule show pref 8915 | grep -q suppress_prefixlength || return 0
   ip -4 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
   ip -4 rule show pref 8930 | grep -q blackhole || return 0
   if ipv6_on; then
+    ip -6 rule show pref 8900 | grep -q "uidrange $FETCH_UID-$FETCH_UID" || return 0
     ip -6 rule show pref 8904 | grep -q "fwmark $TUNMARK" || return 0
     ip -6 rule show pref 8905 | grep -q "fwmark $MARK" || return 0
     ip -6 rule show pref 8915 | grep -q suppress_prefixlength || return 0
@@ -551,6 +564,9 @@ refresh() (
   # 用 /run 下的目录当锁，避免和正在进行的安装/升级同时改配置；重启后锁自动消失。
   mkdir /run/l2tp-vps-refresh.lock 2>/dev/null || exit 0
   trap 'rmdir /run/l2tp-vps-refresh.lock' EXIT
+  # 服务被停止/重启时会收到 TERM；不接住的话 EXIT 不会执行，锁会一直留到重启，域名就再也不会重新解析。
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   [ ! -d /run/l2tp-vps-install.lock ] || exit 0
   if ip -4 addr show dev "$PEER" 2>/dev/null | grep -q 'inet '; then
     exit 0
@@ -584,6 +600,8 @@ ensure_peer_route() {
 # watch：l2tp-vps-watch 服务运行的后台巡检循环。
 watch() {
   tick=0
+  # 只有这个巡检会长期调用 refresh。上一个巡检进程如果被强杀，锁会残留，启动时先清掉。
+  rmdir /run/l2tp-vps-refresh.lock 2>/dev/null || true
   while :; do
     sleep 3
     [ ! -f "$STATE/disabled" ] || continue
@@ -763,8 +781,10 @@ status() {
 # 下面按第一个参数执行对应功能（不带参数等于 status）。测试会删掉 BEGIN DISPATCH 之后的部分再加载本文件。
 # BEGIN DISPATCH
 [ "$(id -u)" = 0 ] || fatal '请用 root 或 sudo 运行'
-load
 cmd=${1:-status}; shift || true
+# 第一次安装如果在写入配置之前就失败，机器上只有 l2tp-vps 而没有 v2-owned，README 的命令会走到 update。
+# 这时网络还没被改动，update 也不需要读配置，直接重新走一遍安装入口；否则会一直报"尚未安装新版"。
+if [ "$cmd" != update ] || [ -f "$STATE/v2-owned" ]; then load; fi
 case "$cmd" in
   legacy-cleanup) legacy_routes;;
   guard) guard;; route) endpoint_route;;
@@ -1041,7 +1061,9 @@ fi
 # 把系统 DNS 换成 1.1.1.1 / 9.9.9.9，并让 DNS 查询也走隧道，防止断线后从原生网络查 DNS 泄露访问记录。
 # 原来的 /etc/resolv.conf 会先备份，recover/卸载时还原。用"先建新链接再改名"的方式替换，避免中途没有 DNS 文件。
 if [ "$(readlink /etc/resolv.conf 2>/dev/null || true)" != /etc/l2tp-vps-resolv.conf ]; then
-  if [ ! -e "$STATE/resolv.conf.before-v2" ] && [ ! -L "$STATE/resolv.conf.before-v2" ]; then
+  # 少数精简系统根本没有 /etc/resolv.conf，没东西可备份就跳过（否则 cp 失败会让安装半途退出）。
+  if [ ! -e "$STATE/resolv.conf.before-v2" ] && [ ! -L "$STATE/resolv.conf.before-v2" ] &&
+     { [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; }; then
     cp -a /etc/resolv.conf "$STATE/resolv.conf.before-v2"
   fi
   printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\noptions timeout:2 attempts:2\n' > /etc/l2tp-vps-resolv.conf
@@ -1083,7 +1105,7 @@ for _attempt in $(seq 1 90); do
   if ip -4 addr show dev "$PEER" 2>/dev/null | grep -q 'inet ' && ip -4 route get 1.1.1.1 2>/dev/null | grep -q "dev $PEER"; then connected=1; break; fi
   sleep 1
 done
-[ "$connected" = 1 ] || fatal 'L2TP 90 秒内没有拨通。请检查：服务器地址、用户名密码、服务商是否放行 UDP 1701。拨号日志：journalctl -u l2tp-vps -n 50（Alpine 看 /var/log/messages）。拨号失败不一定是账号欠费。'
+[ "$connected" = 1 ] || fatal 'L2TP 90 秒内没有拨通。请检查：服务器地址、用户名密码、服务商是否放行 UDP 1701。拨号日志：journalctl -u l2tp-vps -n 50（Alpine 看 /var/log/messages）。拨号失败不一定是账号欠费。账号填错了就重新运行安装命令，按提示输入 y 重新填写。'
 # ---------- 第 17 步：验收（全部通过才算安装成功） ----------
 # 1. 访问"查询我的 IP"网站，看公网出口是不是已经不是 VPS 原生 IP。
 out=$(curl -4 --noproxy '*' -fsS --connect-timeout 10 --max-time 20 https://api.ipify.org || curl -4 --noproxy '*' -fsS --connect-timeout 10 --max-time 20 https://ifconfig.me || true)
