@@ -81,6 +81,7 @@ nft() { printf 'NFT %s\\n' "$*"; cat >/dev/null; }
         out=self.run_sh('restore_policy', '''
 ip() {
   case "$*" in
+    '-4 rule show pref 8900') printf '%s\\n' '8900: from all uidrange 987-987 lookup main';;
     '-4 rule show pref 8904') printf '%s\\n' '8904: from all fwmark 0x24681 lookup 24680';;
     '-4 rule show pref 8905') printf '%s\\n' '8905: from all fwmark 0x24680 lookup main';;
     '-4 rule show pref 8915') printf '%s\\n' '8915: from all lookup main suppress_prefixlength 0';;
@@ -190,7 +191,7 @@ worker() {
 
     def test_version_does_not_install(self):
         r=subprocess.run(['/bin/sh',str(ROOT/'install.sh'),'--version'],text=True,capture_output=True,check=True)
-        self.assertEqual(r.stdout.strip(),'2.0.5')
+        self.assertEqual(r.stdout.strip(),'2.0.6')
 
     def test_failure_recovery_precedes_first_guard(self):
         self.assertLess(INSTALL.index('cat > "$RUNTIME.new"'),INSTALL.index('"$RUNTIME" guard'))
@@ -288,11 +289,11 @@ printf 'lns = 198.51.100.1\\n' > "$STATE/xl2tpd.conf"
 
 class LegacyPasswordTests(unittest.TestCase):
     def test_actual_migration_parser_roundtrips_special_characters(self):
-        code=INSTALL.split('old_pass=$(awk -v user="${L2TP_USER:-$old_user}"',1)[1].split("' /etc/ppp/chap-secrets",1)[0]
+        code=INSTALL.split('old_pass=$(L2TP_MATCH_USER="${L2TP_USER:-$old_user}" awk',1)[1].split("' /etc/ppp/chap-secrets",1)[0]
         awk_program=code[code.index("'")+1:]
         for password in ['normal','spaces and tabs\tend','quote"slash\\hash#dollar$backtick`',' leading and trailing ']:
             escaped=password.replace('\\','\\\\').replace('"','\\"')
-            r=subprocess.run(['awk','-v','user=user@a.1',awk_program],input=f'"user@a.1" * "{escaped}" *\n',text=True,capture_output=True)
+            r=subprocess.run(['awk',awk_program],input=f'"user@a.1" * "{escaped}" *\n',env=dict(os.environ,L2TP_MATCH_USER='user@a.1'),text=True,capture_output=True)
             self.assertEqual(r.returncode,0,r.stderr)
             self.assertEqual(r.stdout,password+'\n')
 

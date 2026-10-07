@@ -122,7 +122,7 @@ class LifecycleTests(unittest.TestCase):
   self.install(first=False)
   self.assertEqual((state/'password').read_bytes(),password)
   self.assertTrue((state/'rollback-path').exists())
-  self.assertEqual((state/'installed-version').read_text().strip(),'2.0.5')
+  self.assertEqual((state/'installed-version').read_text().strip(),'2.0.6')
   self.assertTrue(self.model()['guard'])
   self.assertEqual((self.d/'etc/resolv.conf').read_text().splitlines()[0],'nameserver 1.1.1.1')
   options=(state/'options').read_text()
@@ -168,6 +168,26 @@ class LifecycleTests(unittest.TestCase):
   self.assertIn('systemctl stop xl2tpd',calls)
   self.assertNotIn('pkill',calls)
   self.assertNotIn('route flush',calls)
+ def test_legacy_password_lookup_keeps_backslash_in_user(self):
+  state=self.d/'etc/l2tp-vless';state.mkdir()
+  (state/'net.env').write_text('NATIVE_IP=192.0.2.10\nSERVER_IP=198.51.100.1\n')
+  (self.d/'etc/xl2tpd/xl2tpd.conf').write_text('[global]\n[lac aa]\npppoptfile = '+str(self.d)+'/etc/ppp/options.l2tp-vless\n')
+  (self.d/'etc/ppp/options.l2tp-vless').write_text('name x\n')
+  (self.d/'etc/ppp/chap-secrets').write_text('"DOMAIN\\\\ops" * "pw" *\n')
+  env=dict(self.env,L2TP_USER='DOMAIN\\ops')
+  r=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True)
+  self.assertEqual(r.returncode,0,r.stderr+r.stdout)
+  self.assertEqual((state/'password').read_text(),'pw\n')
+ def test_update_works_before_first_install_wrote_state(self):
+  runtime=self.d/'usr/local/sbin/l2tp-vps'
+  src=(ROOT/'src/runtime.sh').read_text().replace('/etc/',str(self.d)+'/etc/')
+  src='\n'.join(('PATH='+str(self.bin)+':/usr/bin:/bin') if x.startswith('PATH=') else x for x in src.splitlines())+'\n'
+  src=src.replace('\nupdate() (','\nupdate() { echo UPDATE-STARTED; }\nupdate_real() (')
+  runtime.write_text(src)
+  r=self.runtime('update')
+  self.assertEqual(r.returncode,0,r.stderr)
+  self.assertIn('UPDATE-STARTED',r.stdout)
+  self.assertNotEqual(self.runtime('status').returncode,0)
  def pppd_unquote(self,text,key):
   line=[x for x in text.splitlines() if x.startswith(key+' "')][0]
   inner=line[len(key)+2:]
