@@ -212,9 +212,23 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         curl(client,'http://203.0.113.1:18080','--local-port','18090-18099',okay=False)
         curl_in_service('http://203.0.113.1:18080',okay=False)
         assert '18090' not in ns(client,'cat','/proc/sys/net/ipv4/ip_local_reserved_ports').stdout
-        assert not ns(client,'ip','rule','show','pref','8906').stdout.strip()
         assert 'cgroupv2' not in ns(client,'nft','list','table','inet','l2tp_vps').stdout
         print('PASS: clearing excluded ports removes every exception')
+        # The direct-route mark works with no excluded ports at all, e.g. WireGuard's fwmark to its landing server.
+        # L2TP is down here: an unmarked connection is blocked, a marked one leaves natively with full-size packets.
+        assert ns(client,'ip','rule','show','pref','8906').stdout.strip()
+        marked=('import socket,sys\n'
+                's=socket.socket(); s.setsockopt(socket.SOL_SOCKET, 36, 0x24682); s.settimeout(3)\n'
+                's.connect((sys.argv[1], int(sys.argv[2]))); s.sendall(b"GET / HTTP/1.0\\r\\nHost: t\\r\\n\\r\\n")\n'
+                'd=b""\n'
+                'while True:\n'
+                ' c=s.recv(65536)\n'
+                ' if not c: break\n'
+                ' d+=c\n'
+                'print(d.split(b"\\r\\n\\r\\n",1)[1].decode())\n')
+        curl(client,'http://203.0.113.1:18080',okay=False)
+        assert ns(client,'python3','-c',marked,'203.0.113.1','18080').stdout.strip()=='192.0.2.10'
+        print('PASS: mark 0x24682 leaves natively without any excluded port, while everything else stays blocked')
         ns(client,'ip','rule','add','pref','9000','from','198.51.100.99','table','main')
         ns(client,'ip','route','add','blackhole','198.51.100.0/24','table','100')
         runtime('remove_routes; nft delete table inet l2tp_vps')

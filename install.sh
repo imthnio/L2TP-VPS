@@ -378,9 +378,11 @@ ipv6_on() { [ -e /proc/net/if_inet6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/di
 #               隧道断开时隧道表里只剩备用原生路由，容器的新连接会选中它、从原生 IP 出去；这里只放行回包
 #               和排除端口的中转流量。
 #   l2tp_bypass_* 排除端口（见下方 bypass_rules 的说明），没设置排除端口时这几条链是空的、不起作用。
+#   直连标记 BYPASS 的放行和地址伪装（见 mark_rules）不管有没有排除端口都在。
 render_firewall() {
   # 只给回包打标记。新连接不打：8920 规则本来就会把它们送进隧道表，再打标记反而会让维护账号的连接被送错地方。
   bypass_in=; bypass_out=; bypass_nat=; bypass_accept=; bypass_elements=; bypass_cg=
+  mark_rules
   if bypass_on; then bypass_rules; fi
   # flush table 不会清空集合里的旧端口，所以先确保集合存在，再单独清空，最后写入这次的端口。
   cat <<EOF
@@ -466,7 +468,11 @@ EOF
 #      这个服务如果还监听了别的端口（比如一个 xray 同时跑好几个入站），就不按程序排除，以免把别的端口也带出 L2TP。
 # 带 BYPASS 标记的包查主路由表（规则 8906），防火墙放行，源地址不是原生 IP 的做一次地址伪装。
 # 节点程序也可以自己给某个出站设置 mark 149122（即 0x24682，xray 的 sockopt.mark、sing-box 的 routing_mark），
-# 这个出站同样走原生网络；设置 mark 需要 root 权限，普通程序做不到。没有设置排除端口时，以上全部不生效。
+# 这个出站同样走原生网络；设置 mark 需要 root 权限，普通程序做不到。
+# 这个直连标记（路由规则 8906、防火墙放行、地址伪装）不管有没有设置排除端口都生效：比如 WireGuard 用
+# fwmark 0x24682 让自己的加密包直接走原生网卡去连落地机。以前只在设了排除端口时才有，没设时带标记的包
+# 被送进 L2TP（MTU 只有 1400），握手和 ping 这种小包能过，网页这种大包就卡住。
+# 没有设置排除端口时，上面 1~3 层不生效。
 #
 # normalize_ports：检查并整理用户输入的端口。支持空格、逗号、顿号分隔，支持 2000-2010 这样的范围。
 #   输出每行一个端口或端口段，按从小到大排好，重叠或相邻的段会合并。有任何一项不合法就什么都不输出、
@@ -587,6 +593,16 @@ bypass_rules() {
   fi
   bypass_out="$bypass_out
     jump l2tp_bypass_cg"
+  # 上次成功装上的按程序排除规则一起写进去，重写防火墙的那一瞬间也不会有空档。
+  # 只接受本项目自己生成的格式；这些规则加载失败时 guard 会不带它们再装一次。
+  if [ -z "${BYPASS_NO_CG:-}" ] && [ -f /run/l2tp-vps-bypass.rules ]; then
+    bypass_cg=$(awk -v mark="$BYPASS" '
+      $0 ~ "^socket cgroupv2 level [0-9]+ \"([A-Za-z0-9._@:/-]|\\\\x[0-9A-Fa-f][0-9A-Fa-f])+\" ct mark set " mark " meta mark set " mark " accept$" { printf "\n    %s", $0 }' /run/l2tp-vps-bypass.rules)
+  fi
+}
+# mark_rules：带直连标记 BYPASS 的包（排除端口的连接，或程序自己设置了 mark 0x24682）的放行和地址伪装。
+#   不管有没有排除端口都生成，见上方说明。
+mark_rules() {
   # 本机程序连接时先按隧道表选了隧道地址当源地址，改走原生网卡后要换成原生 IP，否则回包回不来。
   #   源地址本来就是原生 IP 的（程序自己绑定了某个原生 IP）不改，保留程序选的那个 IP。
   v4=$(addresses "$STATE/native-v4.txt" '^[0-9.]+$'); [ -n "$v4" ] || v4=$NATIVE_IP
@@ -602,12 +618,6 @@ bypass_rules() {
   fi
   bypass_accept="
     oifname \"$NATIVE_IF\" meta mark $BYPASS accept"
-  # 上次成功装上的按程序排除规则一起写进去，重写防火墙的那一瞬间也不会有空档。
-  # 只接受本项目自己生成的格式；这些规则加载失败时 guard 会不带它们再装一次。
-  if [ -z "${BYPASS_NO_CG:-}" ] && [ -f /run/l2tp-vps-bypass.rules ]; then
-    bypass_cg=$(awk -v mark="$BYPASS" '
-      $0 ~ "^socket cgroupv2 level [0-9]+ \"([A-Za-z0-9._@:/-]|\\\\x[0-9A-Fa-f][0-9A-Fa-f])+\" ct mark set " mark " meta mark set " mark " accept$" { printf "\n    %s", $0 }' /run/l2tp-vps-bypass.rules)
-  fi
 }
 # bypass_scan：找出正在监听排除端口的程序，判断能不能把这个程序的全部出站改走原生网络。
 # 每行输出一条，字段用 | 分隔：
@@ -867,7 +877,7 @@ guard() {
   # 4. 加策略规则（数字越小越先匹配）：
   #    8900 维护账号 l2tp-fetch 查主路由表（可以走原生网络，用来查 DNS、下载更新）
   #    8904/8905 带标记的包：TUNMARK 进隧道表，MARK（回包）查主路由表
-  #    8906 排除端口的包（BYPASS 标记）查主路由表，只在设置了排除端口时存在
+  #    8906 带直连标记（BYPASS）的包查主路由表：排除端口的连接，或程序自己设置了 mark 0x24682
   #    8907 源端口是排除端口的包查主路由表（见 bypass_sport_rule），只在排除端口已保留时存在
   #    8911 IPv6 链路本地/组播地址查主表（邻居发现要用原生网卡）
   #    8915 主路由表里的具体网段（Docker 网桥、内网）优先，但忽略主表的默认路由
@@ -914,13 +924,10 @@ guard() {
   # 防火墙表刚被整体重写，按程序排除的规则要重新填。
   bypass_refresh force >/dev/null 2>&1 || true
 }
-# bypass_rule 4或6：设置了排除端口就加 8906（BYPASS 标记查主路由表），没设置就删掉它。
+# bypass_rule 4或6：8906（直连标记查主路由表）一直都加，不管有没有排除端口（见排除端口一节的说明）；
+#   再按排除端口增删 8907。
 bypass_rule() {
-  if bypass_on; then
-    rule "$1" 8906 "fwmark $BYPASS lookup main" fwmark "$BYPASS" table main
-  else
-    drop_rule "$1" pref 8906 fwmark "$BYPASS" table main
-  fi
+  rule "$1" 8906 "fwmark $BYPASS lookup main" fwmark "$BYPASS" table main
   bypass_sport_rule "$1"
 }
 # bypass_sport_rule 4或6 [release]：8907 让源端口是排除端口的包从一开始就查主路由表。
@@ -1072,10 +1079,8 @@ policy_missing() {
   ip -4 rule show pref 8915 | grep -q suppress_prefixlength || return 0
   ip -4 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
   ip -4 rule show pref 8930 | grep -q blackhole || return 0
-  if bypass_on; then
-    ip -4 rule show pref 8906 | grep -q "fwmark $BYPASS" || return 0
-    ! ipv6_on || ip -6 rule show pref 8906 | grep -q "fwmark $BYPASS" || return 0
-  fi
+  ip -4 rule show pref 8906 | grep -q "fwmark $BYPASS" || return 0
+  ! ipv6_on || ip -6 rule show pref 8906 | grep -q "fwmark $BYPASS" || return 0
   if ipv6_on; then
     ip -6 rule show pref 8900 | grep -q "uidrange $FETCH_UID-$FETCH_UID" || return 0
     ip -6 rule show pref 8904 | grep -q "fwmark $TUNMARK" || return 0
@@ -1322,7 +1327,11 @@ rollback() {
 }
 # bypass_show：用大白话显示排除端口，以及每个端口现在是怎么生效的。
 bypass_show() {
-  if ! bypass_on; then echo '不走 L2TP 的端口：无'; return 0; fi
+  if ! bypass_on; then
+    echo '不走 L2TP 的端口：无'
+    echo '  高级：程序给某个出站设置 mark 149122（0x24682，如 WireGuard 的 fwmark），这个出站走 VPS 原生 IP、不经过 L2TP。'
+    return 0
+  fi
   printf '不走 L2TP 的端口：%s\n' "$(port_list ' ')"
   if [ -f "$STATE/disabled" ]; then echo '  （L2TP 已关闭，整台 VPS 现在都用原生 IP；重新运行安装命令后按上面的端口排除）'; return 0; fi
   if reserve_ok; then

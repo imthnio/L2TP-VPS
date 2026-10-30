@@ -344,7 +344,10 @@ class BypassTests(unittest.TestCase):
 
     def test_no_ports_means_no_bypass_rules_at_all(self):
         out = self.run_sh('render_firewall').stdout
-        self.assertNotIn('0x24682', out)
+        self.assertNotIn('ct mark set 0x24682', out)
+        # The direct-route mark itself always works (e.g. WireGuard fwmark), ports or not.
+        self.assertIn('oifname "eth0" meta mark 0x24682 accept', out)
+        self.assertIn('oifname "eth0" meta mark 0x24682 ip saddr != { 192.0.2.10, 192.0.2.11 } masquerade', out)
         self.assertNotIn('elements', out)
         self.assertNotIn('jump', out)
         # Chains exist but stay empty, so re-renders and rollbacks remain valid.
@@ -404,7 +407,8 @@ class BypassTests(unittest.TestCase):
     def test_corrupt_port_file_fails_safe(self):
         (self.d/'bypass-ports').write_text('1112\nrm -rf /\n')
         out = self.run_sh('render_firewall; bypass_on && echo ON || echo OFF').stdout
-        self.assertNotIn('0x24682', out)
+        self.assertNotIn('ct mark set 0x24682', out)
+        self.assertNotIn('elements', out)
         self.assertIn('OFF', out)
 
     def test_rendered_bypass_rules(self):
@@ -458,11 +462,11 @@ class BypassTests(unittest.TestCase):
         self.assertEqual((self.d/'proc/sys/net/ipv4/ip_local_reserved_ports').read_text().strip(), '')
         self.assertNotIn('sport @bypass_ports', self.run_sh('render_firewall').stdout)
 
-    def test_guard_adds_bypass_route_rule_only_when_configured(self):
+    def test_guard_always_adds_the_mark_route_rule(self):
         setup = GUARD_STUBS
         out = self.run_sh('guard', setup).stdout
-        self.assertIn('-4 rule del pref 8906 fwmark 0x24682 table main', out)
-        self.assertNotIn('rule add pref 8906', out)
+        self.assertIn('-4 rule add pref 8906 fwmark 0x24682 table main', out)
+        self.assertNotIn('rule del pref 8906', out)
         (self.d/'bypass-ports').write_text('1112\n')
         out = self.run_sh('guard', setup).stdout
         self.assertIn('-4 rule add pref 8906 fwmark 0x24682 table main', out)

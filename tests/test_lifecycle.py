@@ -151,8 +151,10 @@ class LifecycleTests(unittest.TestCase):
   r=self.runtime('ports','3000');self.assertEqual(r.returncode,0,r.stderr)
   self.assertIn('elements = { 3000 }',self.model()['rules'])
   r=self.runtime('ports','0');self.assertEqual(r.returncode,0,r.stderr)
-  self.assertNotIn('0x24682',self.model()['rules'])
-  self.assertFalse(any('pref 8906' in x for x in self.model().get('rules_ip',[])))
+  self.assertNotIn('ct mark set 0x24682',self.model()['rules'])
+  self.assertNotIn('elements',self.model()['rules'])
+  # The direct-route mark stays: tools like WireGuard rely on it without any excluded port.
+  self.assertTrue(any('pref 8906' in x for x in self.model().get('rules_ip',[])))
   # recover keeps the setting for the next install but removes every rule.
   self.runtime('ports','1112')
   r=self.runtime('recover');self.assertEqual(r.returncode,0,r.stderr)
@@ -167,7 +169,7 @@ class LifecycleTests(unittest.TestCase):
   r=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True)
   self.assertEqual(r.returncode,0,r.stderr+r.stdout)
   self.assertFalse((self.d/'etc/l2tp-vless/bypass-ports').exists())
-  self.assertNotIn('0x24682',self.model()['rules'])
+  self.assertNotIn('ct mark set 0x24682',self.model()['rules'])
  def model(self):return json.loads((self.d/'model.json').read_text())
  def test_fresh_then_upgrade_preserves_credentials_and_snapshot(self):
   first=self.install();state=self.d/'etc/l2tp-vless'
