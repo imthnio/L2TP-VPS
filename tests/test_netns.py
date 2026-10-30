@@ -31,6 +31,9 @@ with tempfile.TemporaryDirectory(prefix='l2tp-netns-') as directory:
     d=Path(directory)
     library=d/'runtime.sh'
     library.write_text((ROOT/'src/runtime.sh').read_text().split('# BEGIN DISPATCH')[0])
+    # An "old kernel" copy whose nft cgroup rules never load, forcing the iptables fallback.
+    old_kernel=d/'runtime-old-kernel.sh'
+    old_kernel.write_text(library.read_text().replace('socket cgroupv2 level','socket cgroupv2_unsupported level'))
     (d/'native-v4.txt').write_text('192.0.2.10\n')
     (d/'native-v6.txt').write_text('2001:db8:1::10\n')
     prefix=f'''. {shlex.quote(str(library))}
@@ -43,6 +46,16 @@ FETCH_UID=65534
 INIT=systemd
 '''
     def runtime(body): return ns(client,'/bin/sh','-c',prefix+body)
+    # ip netns exec remounts /sys and hides the cgroup tree; nft needs it to resolve a service's cgroup path.
+    cgroup_dir=Path('/sys/fs/cgroup')/('l2vp-'+suffix)
+    def runtime_mounts(body): return run('nsenter','--net=/run/netns/'+client,'/bin/sh','-c',prefix+body)
+    def curl_in_service(url,okay=True):
+        # Stands in for a node running as its own service: the shell joins the cgroup, then execs curl.
+        script='echo $$ > '+shlex.quote(str(cgroup_dir/'cgroup.procs'))+'; exec curl --noproxy "*" -g -fsS --connect-timeout 1 --max-time 2 '+shlex.quote(url)
+        result=run('nsenter','--net=/run/netns/'+client,'/bin/sh','-c',script,check=False)
+        if okay and result.returncode: raise AssertionError(result.stderr)
+        if not okay and not result.returncode: raise AssertionError('Unexpected native egress: '+result.stdout)
+        return result.stdout.strip()
     def curl(where,url,*args,okay=True):
         result=ns(where,'curl','--noproxy','*','-g','-fsS','--connect-timeout','1','--max-time','2',*args,url,check=False)
         if okay and result.returncode: raise AssertionError(result.stderr)
@@ -144,11 +157,63 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         assert curl(client,'http://172.18.0.2:18084')=='172.18.0.1'
         assert curl(server,'http://192.0.2.10:18085','--interface','203.0.113.1')=='203.0.113.1'
         print('PASS: Docker bridge containers use the tunnel, published ports reply natively, host reaches containers')
+        # Excluded ports: their traffic avoids L2TP completely, and nothing else may.
+        cgroup_dir.mkdir()
+        (d/'bypass-ports').write_text('18081\n18090-18099\n')
+        runtime_mounts("bypass_scan() { echo 'ok|/"+cgroup_dir.name+"|18081'; }\nguard")
+        table=ns(client,'nft','list','table','inet','l2tp_vps').stdout
+        assert 'socket cgroupv2' in table and 'sport @bypass_ports' in table, table
+        assert '18090-18099' in ns(client,'cat','/proc/sys/net/ipv4/ip_local_reserved_ports').stdout
+        ns(client,'nft','add table ip relaysim; add chain ip relaysim pre { type nat hook prerouting priority dstnat; }; add rule ip relaysim pre iifname "eth0" tcp dport 18120 dnat to 203.0.113.1:18080')
+        assert curl(client,'http://203.0.113.1:18080')=='198.18.0.1'
+        assert curl(client,'http://203.0.113.1:18080','--interface','192.0.2.10')=='198.18.0.1'
+        assert curl(client,'http://203.0.113.1:18080','--local-port','18100-18109')=='198.18.0.1'
+        assert curl(box,'http://203.0.113.1:18080')=='198.18.0.1'
+        assert curl(client,'http://203.0.113.1:18080','--local-port','18090-18099')=='192.0.2.10'
+        assert curl_in_service('http://203.0.113.1:18080')=='192.0.2.10'
+        assert curl_in_service('http://[2001:db8:1::20]:18082')=='2001:db8:1::10'
+        assert curl(server,'http://192.0.2.10:18081')=='192.0.2.20'
+        # L2TP is outbound only: nobody may connect in through the tunnel address, excluded port or not.
+        curl(server,'http://198.18.0.1:18081',okay=False)
+        curl(server,'http://198.18.0.1:18083',okay=False)
+        # Old kernels: nft cannot match the service, so iptables' cgroup match takes over.
+        run('nsenter','--net=/run/netns/'+client,'/bin/sh','-c',prefix.replace(str(library),str(old_kernel))+"bypass_scan() { echo 'ok|/"+cgroup_dir.name+"|18081'; }\nguard")
+        assert 'cgroupv2' not in ns(client,'nft','list','table','inet','l2tp_vps').stdout
+        assert 'L2TP_VPS_BYPASS' in ns(client,'iptables','-t','mangle','-S').stdout
+        assert curl_in_service('http://203.0.113.1:18080')=='192.0.2.10'
+        assert curl(client,'http://203.0.113.1:18080')=='198.18.0.1'
+        runtime_mounts("bypass_scan() { echo 'ok|/"+cgroup_dir.name+"|18081'; }\nguard")
+        assert 'L2TP_VPS_BYPASS' not in ns(client,'iptables','-t','mangle','-S').stdout
+        assert curl_in_service('http://203.0.113.1:18080')=='192.0.2.10'
+        print('PASS: the tunnel address accepts no inbound connections; old kernels exclude services through iptables')
+        # A DNAT relay on a non-excluded port goes through the tunnel; on an excluded port it leaves natively.
+        assert curl(server,'http://192.0.2.10:18120')=='198.18.0.1'
+        runtime_mounts("bypass_scan() { echo 'ok|/"+cgroup_dir.name+"|18081'; }\nprintf '18081\\n18090-18099\\n18120\\n' > \"$STATE/bypass-ports\"; guard")
+        assert curl(server,'http://192.0.2.10:18120')=='192.0.2.10'
+        print('PASS: excluded ports, their source ports and their service use the native IP; all other traffic stays in L2TP')
         ns(client,'ip','link','delete','l2tp-aa') # Hard loss, without ip-down hook.
         curl(client,'http://203.0.113.1:18080',okay=False)
         curl(client,'http://203.0.113.1:18080','--interface','192.0.2.10',okay=False)
         assert curl(server,'http://192.0.2.10:18081')=='192.0.2.20'
-        print('PASS: online and native-bound traffic use the tunnel; IPv6 does not leak; foreign PPP cannot replace it; hard interface loss does not fall back')
+        # Forwarded traffic skips the output hook; it must not take the native fallback route.
+        curl(box,'http://203.0.113.1:18080',okay=False)
+        assert curl(server,'http://192.0.2.10:18085','--interface','203.0.113.1')=='203.0.113.1'
+        assert curl(client,'http://172.18.0.2:18084')=='172.18.0.1'
+        print('PASS: online and native-bound traffic use the tunnel; IPv6 does not leak; foreign PPP cannot replace it; hard interface loss does not fall back, forwarded containers included')
+        # With L2TP down, excluded traffic keeps working natively while the kill switch still blocks the rest.
+        assert curl(client,'http://203.0.113.1:18080','--local-port','18090-18099')=='192.0.2.10'
+        assert curl_in_service('http://203.0.113.1:18080')=='192.0.2.10'
+        curl(client,'http://203.0.113.1:18080','--local-port','18100-18109',okay=False)
+        assert curl(server,'http://192.0.2.10:18120')=='192.0.2.10'
+        print('PASS: excluded ports keep working while L2TP is down, without opening a gap for anything else')
+        (d/'bypass-ports').unlink()
+        runtime_mounts('guard')
+        curl(client,'http://203.0.113.1:18080','--local-port','18090-18099',okay=False)
+        curl_in_service('http://203.0.113.1:18080',okay=False)
+        assert '18090' not in ns(client,'cat','/proc/sys/net/ipv4/ip_local_reserved_ports').stdout
+        assert not ns(client,'ip','rule','show','pref','8906').stdout.strip()
+        assert 'cgroupv2' not in ns(client,'nft','list','table','inet','l2tp_vps').stdout
+        print('PASS: clearing excluded ports removes every exception')
         ns(client,'ip','rule','add','pref','9000','from','198.51.100.99','table','main')
         ns(client,'ip','route','add','blackhole','198.51.100.0/24','table','100')
         runtime('remove_routes; nft delete table inet l2tp_vps')
@@ -165,3 +230,4 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
             try: p.wait(timeout=3)
             except subprocess.TimeoutExpired: p.kill();p.wait()
         for name in reversed(created): run('ip','netns','delete',name,check=False)
+        if cgroup_dir.exists(): cgroup_dir.rmdir()

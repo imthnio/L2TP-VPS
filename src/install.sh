@@ -22,7 +22,7 @@
 set -eu
 # SSH 断开时终端会发 HUP 信号，这里忽略它，避免安装做到一半被打断。
 trap '' HUP
-VERSION=2.0.6
+VERSION=2.1.0
 case "${1:-}" in --version) echo "$VERSION"; exit 0;; esac
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -110,6 +110,34 @@ if [ -f "$STATE/password" ] && [ ! -f "$STATE/installed-version" ] && [ -t 0 ] &
   IFS= read -r redo || redo=
   case "$redo" in y|Y|yes|YES) old_server=; old_user=; old_pass=;; esac
 fi
+# normalize_ports：检查并整理"不走 L2TP 的端口"。和管理命令 l2tp-vps 里的同名函数完全相同（安装到这一步时
+#   管理命令还没装好，所以这里放一份副本），改动时两处一起改，测试会检查两份一致。
+#   输出每行一个端口或端口段，从小到大，重叠或相邻的段合并；有任何一项不合法就什么都不输出、返回 2。
+normalize_ports() {
+  printf '%s\n' "$1" | sed 's/，/ /g; s/[,;]/ /g' | awk '
+    function out(a, b) { print (a == b) ? a : a "-" b }
+    { for (i = 1; i <= NF; i++) {
+        t = $i
+        if (t !~ /^[0-9]+(-[0-9]+)?$/) { bad = 1; exit }
+        n = split(t, p, "-"); a = p[1] + 0; b = (n == 2) ? p[2] + 0 : a
+        if (a < 1 || b > 65535 || a > b) { bad = 1; exit }
+        c++; lo[c] = a; hi[c] = b
+    } }
+    END {
+      if (bad) exit 2
+      for (i = 2; i <= c; i++) {
+        x = lo[i]; y = hi[i]
+        for (j = i - 1; j >= 1 && lo[j] > x; j--) { lo[j + 1] = lo[j]; hi[j + 1] = hi[j] }
+        lo[j + 1] = x; hi[j + 1] = y
+      }
+      for (i = 1; i <= c; i++) {
+        if (m && lo[i] <= e + 1) { if (hi[i] > e) e = hi[i]; continue }
+        if (m) out(s, e)
+        s = lo[i]; e = hi[i]; m = 1
+      }
+      if (m) out(s, e)
+    }'
+}
 # 环境变量 L2TP_SERVER / L2TP_USER / L2TP_PASS 优先；没给就用旧配置里的值。
 SERVER=${L2TP_SERVER:-$old_server}
 USER_NAME=${L2TP_USER:-$old_user}
@@ -132,6 +160,35 @@ if [ -z "$PASSWORD" ]; then
   stty echo; printf '\n'
   trap 'exit 130' INT
   trap 'exit 143' TERM
+fi
+# 不走 L2TP 的端口（排除端口）：这些端口上无论跑网站还是节点，都用 VPS 自己的 IP 进出，和 L2TP 互不影响。
+# 首次安装和以后每次重新运行都会问一次，直接回车保持原样（首次安装回车就是不设置）。
+# 无终端时：设置了环境变量 L2TP_BYPASS_PORTS 就用它（0 表示清空），否则保留原来的设置。
+# 装好以后也可以随时用 sudo l2tp-vps ports 修改，立即生效。
+BYPASS_PORTS=$(normalize_ports "$(cat "$STATE/bypass-ports" 2>/dev/null || true)" 2>/dev/null || true)
+if [ "${L2TP_BYPASS_PORTS+set}" = set ]; then
+  case "$L2TP_BYPASS_PORTS" in
+    0|none|无) BYPASS_PORTS=;;
+    *) BYPASS_PORTS=$(normalize_ports "$L2TP_BYPASS_PORTS") || fatal "L2TP_BYPASS_PORTS 格式不对：$L2TP_BYPASS_PORTS";;
+  esac
+elif [ -t 0 ]; then
+  printf '\n可选：设置不走 L2TP 的端口。这些端口上的网站或节点，进出都用 VPS 自己的 IP，完全不受 L2TP 影响。\n'
+  printf '多个端口用空格或逗号分隔，支持 2000-2010 这样的范围。\n'
+  while :; do
+    current=$(printf '%s\n' "$BYPASS_PORTS" | awk 'NF {printf "%s%s", (n++ ? " " : ""), $1}')
+    if [ -n "$current" ]; then
+      printf '不走 L2TP 的端口 [当前：%s]（回车保持不变，0 表示清空）: ' "$current"
+    else
+      printf '不走 L2TP 的端口（没有就直接回车）: '
+    fi
+    IFS= read -r answer || answer=
+    case "$answer" in
+      '') break;;
+      0|none|无) BYPASS_PORTS=; break;;
+    esac
+    if new_ports=$(normalize_ports "$answer") && [ -n "$new_ports" ]; then BYPASS_PORTS=$new_ports; break; fi
+    printf '格式不对：只能填 1-65535 的数字，或 2000-2010 这样的范围。请重新输入。\n'
+  done
 fi
 # 检查输入：服务器只允许域名或 IPv4 的字符（字母、数字、点、减号），防止把奇怪内容写进配置。
 case "$SERVER" in ''|*[!A-Za-z0-9.-]*|-*) fatal '服务器必须是域名或 IPv4';; esac
@@ -173,6 +230,16 @@ if [ "$need" = 1 ]; then
   fi
 fi
 for binary in curl ip nft xl2tpd pppd su nslookup timeout; do command -v "$binary" >/dev/null || fatal "缺少 $binary"; done
+# 设置了排除端口、内核又低于 5.13 时，nftables 不能按程序排除，要用 iptables 的兼容方式，没装就补装。
+# 装不上也不影响安装，只是排除端口退回到"只排除端口本身的进出"。
+if [ -n "$BYPASS_PORTS" ] && ! command -v iptables >/dev/null 2>&1 &&
+   uname -r | awk -F'[.-]' '{exit !($1 < 5 || ($1 == 5 && $2 < 13))}'; then
+  if [ "$INIT" = openrc ]; then
+    apk add --no-cache iptables ip6tables >/dev/null 2>&1 || info '没能安装 iptables：老内核上只排除端口本身的进出'
+  else
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y iptables >/dev/null 2>&1 || info '没能安装 iptables：老内核上只排除端口本身的进出'
+  fi
+fi
 # 用 apt 装 xl2tpd 时，系统自带的 xl2tpd 服务会被自动启动，没配任何连接却在公网监听 UDP 1701。
 # 本项目用自己独立的一份 xl2tpd，所以只把这个"没配置、白开着"的系统自带服务停掉并禁用；
 # 如果它的配置里写了任何 [lac]/[lns] 连接（说明有人在用），就完全不动。
@@ -195,10 +262,11 @@ fi
 # 本项目要用：路由表 24680、若干条策略路由优先级、nftables 表 l2tp_vps、网卡名 l2tp-aa、系统用户 l2tp-fetch。
 # 第一次安装时如果发现它们已被别的软件占用，就停下来，绝不清空或覆盖别人的配置。
 # l2tp-fetch 是一个专用的"维护账号"：只有它能在隧道断开时走 VPS 原生网络查 DNS、下载更新。
+# 升级时不重新检查优先级：新版新增的 8906 只在设置排除端口时使用，添加前会先看有没有完全相同的规则。
 if [ ! -f "$STATE/v2-owned" ]; then
   for family in -4 -6; do
     [ -z "$(ip "$family" route show table 24680 2>/dev/null)" ] || fatal '路由表 24680 已被其他软件使用'
-    for pref in 8900 8904 8905 8910 8911 8915 8920 8930; do
+    for pref in 8900 8904 8905 8906 8910 8911 8915 8920 8930; do
       [ -z "$(ip "$family" rule show pref "$pref" 2>/dev/null)" ] || fatal "路由优先级 $pref 已被其他软件使用"
     done
   done
@@ -228,7 +296,7 @@ mkdir -p "$STATE/backups" /usr/local/sbin /usr/local/bin /etc/ppp/ip-up.d /etc/p
 chmod 700 "$STATE" "$STATE/backups"
 BACKUP="$STATE/backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 mkdir "$BACKUP"
-for f in net.env native-v4.txt native-v6.txt server user password installed-version install.sh xl2tpd.conf options v2-owned disabled; do
+for f in net.env native-v4.txt native-v6.txt server user password installed-version install.sh xl2tpd.conf options v2-owned disabled bypass-ports; do
   [ ! -f "$STATE/$f" ] || cp -p "$STATE/$f" "$BACKUP/$f"
 done
 [ ! -f "$RUNTIME" ] || cp -p "$RUNTIME" "$BACKUP/runtime.sh"
@@ -289,6 +357,13 @@ printf '%s\n' "$USER_NAME" > "$STATE/user"
 printf '%s\n' "$PASSWORD" > "$STATE/password"
 touch "$STATE/v2-owned"
 chmod 600 "$STATE/net.env" "$STATE/native-v4.txt" "$STATE/native-v6.txt" "$STATE/server" "$STATE/user" "$STATE/password" "$STATE/v2-owned"
+# 排除端口在打开断线保护（第 13 步的 guard）之前写好，guard 会一次性把它们装进防火墙和路由。
+if [ -n "$BYPASS_PORTS" ]; then
+  printf '%s\n' "$BYPASS_PORTS" > "$STATE/bypass-ports"
+  chmod 600 "$STATE/bypass-ports"
+else
+  rm -f "$STATE/bypass-ports"
+fi
 
 # ---------- 第 9 步：写拨号配置 ----------
 # 本项目用自己独立的一份 xl2tpd 配置和进程，不碰系统自带的 /etc/xl2tpd/xl2tpd.conf，也不改共享的
@@ -593,11 +668,22 @@ if [ -n "$v6" ]; then
   v6out=$(printf '%s' "$v6out" | tr -d '[:space:]')
   [ "$v6out" != "$v6" ] || fatal 'IPv6 仍从 VPS 原生地址出去'
 fi
+# 5. 设置了排除端口时：确认防火墙里有排除规则，并且带排除标记的包确实从原生网卡出去、不进隧道。
+#    这里只查路由，不真的拿排除端口去连外网：那样会让这个端口短暂处于 TIME_WAIT，节点可能一时绑定不上。
+if [ -n "$BYPASS_PORTS" ]; then
+  nft list chain inet l2tp_vps l2tp_bypass_in 2>/dev/null | grep -q 'dport @bypass_ports' || fatal '排除端口的防火墙规则没有生效；可运行 sudo l2tp-vps ports 0 清空排除端口后重试'
+  ip -4 rule show pref 8906 2>/dev/null | grep -q 'fwmark 0x24682' || fatal '排除端口的路由规则没有生效；可运行 sudo l2tp-vps ports 0 清空排除端口后重试'
+  ip -4 route get 1.1.1.1 mark 0x24682 2>/dev/null | grep -q "dev $NATIVE_IF" || fatal '排除端口的流量没有走原生网卡；可运行 sudo l2tp-vps ports 0 清空排除端口后重试'
+  nft list chain inet l2tp_vps l2tp_bypass_out 2>/dev/null | grep -q 'sport @bypass_ports' ||
+    info '排除端口太多或内核不允许保留端口（常见于容器 VPS），不按源端口排除；连进排除端口的连接仍走 VPS 原生 IP'
+fi
 # 全部通过：记下版本号，保存这份安装器（以后 rollback 用），打印结果。SUCCESS=1 让 finish 不再报失败。
 printf '%s\n' "$VERSION" > "$STATE/installed-version"
 if [ -f "$0" ]; then cp "$0" "$STATE/install.sh"; chmod 600 "$STATE/install.sh"; fi
 info "安装/升级成功：${VERSION}；公网出口 ${out}，不是 VPS 原生地址"
 info "本机新连接和节点出站都走 L2TP。SSH 与节点端口仍使用 VPS 原地址 ${NATIVE_IP}。"
 info '以后重复运行 README 安装命令，或运行 sudo l2tp-vps update，即可升级并保留账号。'
-info '状态：sudo l2tp-vps status；恢复原生网络：sudo l2tp-vps recover；卸载：sudo shanchu'
+info '状态：sudo l2tp-vps status；不走 L2TP 的端口：sudo l2tp-vps ports；恢复原生网络：sudo l2tp-vps recover；卸载：sudo shanchu'
 SUCCESS=1
+# 最后显示排除端口的生效情况（只是显示，出错也不影响安装结果）。
+if [ -n "$BYPASS_PORTS" ]; then "$RUNTIME" ports </dev/null || true; fi

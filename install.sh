@@ -22,7 +22,7 @@
 set -eu
 # SSH 断开时终端会发 HUP 信号，这里忽略它，避免安装做到一半被打断。
 trap '' HUP
-VERSION=2.0.6
+VERSION=2.1.0
 case "${1:-}" in --version) echo "$VERSION"; exit 0;; esac
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -110,6 +110,34 @@ if [ -f "$STATE/password" ] && [ ! -f "$STATE/installed-version" ] && [ -t 0 ] &
   IFS= read -r redo || redo=
   case "$redo" in y|Y|yes|YES) old_server=; old_user=; old_pass=;; esac
 fi
+# normalize_ports：检查并整理"不走 L2TP 的端口"。和管理命令 l2tp-vps 里的同名函数完全相同（安装到这一步时
+#   管理命令还没装好，所以这里放一份副本），改动时两处一起改，测试会检查两份一致。
+#   输出每行一个端口或端口段，从小到大，重叠或相邻的段合并；有任何一项不合法就什么都不输出、返回 2。
+normalize_ports() {
+  printf '%s\n' "$1" | sed 's/，/ /g; s/[,;]/ /g' | awk '
+    function out(a, b) { print (a == b) ? a : a "-" b }
+    { for (i = 1; i <= NF; i++) {
+        t = $i
+        if (t !~ /^[0-9]+(-[0-9]+)?$/) { bad = 1; exit }
+        n = split(t, p, "-"); a = p[1] + 0; b = (n == 2) ? p[2] + 0 : a
+        if (a < 1 || b > 65535 || a > b) { bad = 1; exit }
+        c++; lo[c] = a; hi[c] = b
+    } }
+    END {
+      if (bad) exit 2
+      for (i = 2; i <= c; i++) {
+        x = lo[i]; y = hi[i]
+        for (j = i - 1; j >= 1 && lo[j] > x; j--) { lo[j + 1] = lo[j]; hi[j + 1] = hi[j] }
+        lo[j + 1] = x; hi[j + 1] = y
+      }
+      for (i = 1; i <= c; i++) {
+        if (m && lo[i] <= e + 1) { if (hi[i] > e) e = hi[i]; continue }
+        if (m) out(s, e)
+        s = lo[i]; e = hi[i]; m = 1
+      }
+      if (m) out(s, e)
+    }'
+}
 # 环境变量 L2TP_SERVER / L2TP_USER / L2TP_PASS 优先；没给就用旧配置里的值。
 SERVER=${L2TP_SERVER:-$old_server}
 USER_NAME=${L2TP_USER:-$old_user}
@@ -132,6 +160,35 @@ if [ -z "$PASSWORD" ]; then
   stty echo; printf '\n'
   trap 'exit 130' INT
   trap 'exit 143' TERM
+fi
+# 不走 L2TP 的端口（排除端口）：这些端口上无论跑网站还是节点，都用 VPS 自己的 IP 进出，和 L2TP 互不影响。
+# 首次安装和以后每次重新运行都会问一次，直接回车保持原样（首次安装回车就是不设置）。
+# 无终端时：设置了环境变量 L2TP_BYPASS_PORTS 就用它（0 表示清空），否则保留原来的设置。
+# 装好以后也可以随时用 sudo l2tp-vps ports 修改，立即生效。
+BYPASS_PORTS=$(normalize_ports "$(cat "$STATE/bypass-ports" 2>/dev/null || true)" 2>/dev/null || true)
+if [ "${L2TP_BYPASS_PORTS+set}" = set ]; then
+  case "$L2TP_BYPASS_PORTS" in
+    0|none|无) BYPASS_PORTS=;;
+    *) BYPASS_PORTS=$(normalize_ports "$L2TP_BYPASS_PORTS") || fatal "L2TP_BYPASS_PORTS 格式不对：$L2TP_BYPASS_PORTS";;
+  esac
+elif [ -t 0 ]; then
+  printf '\n可选：设置不走 L2TP 的端口。这些端口上的网站或节点，进出都用 VPS 自己的 IP，完全不受 L2TP 影响。\n'
+  printf '多个端口用空格或逗号分隔，支持 2000-2010 这样的范围。\n'
+  while :; do
+    current=$(printf '%s\n' "$BYPASS_PORTS" | awk 'NF {printf "%s%s", (n++ ? " " : ""), $1}')
+    if [ -n "$current" ]; then
+      printf '不走 L2TP 的端口 [当前：%s]（回车保持不变，0 表示清空）: ' "$current"
+    else
+      printf '不走 L2TP 的端口（没有就直接回车）: '
+    fi
+    IFS= read -r answer || answer=
+    case "$answer" in
+      '') break;;
+      0|none|无) BYPASS_PORTS=; break;;
+    esac
+    if new_ports=$(normalize_ports "$answer") && [ -n "$new_ports" ]; then BYPASS_PORTS=$new_ports; break; fi
+    printf '格式不对：只能填 1-65535 的数字，或 2000-2010 这样的范围。请重新输入。\n'
+  done
 fi
 # 检查输入：服务器只允许域名或 IPv4 的字符（字母、数字、点、减号），防止把奇怪内容写进配置。
 case "$SERVER" in ''|*[!A-Za-z0-9.-]*|-*) fatal '服务器必须是域名或 IPv4';; esac
@@ -173,6 +230,16 @@ if [ "$need" = 1 ]; then
   fi
 fi
 for binary in curl ip nft xl2tpd pppd su nslookup timeout; do command -v "$binary" >/dev/null || fatal "缺少 $binary"; done
+# 设置了排除端口、内核又低于 5.13 时，nftables 不能按程序排除，要用 iptables 的兼容方式，没装就补装。
+# 装不上也不影响安装，只是排除端口退回到"只排除端口本身的进出"。
+if [ -n "$BYPASS_PORTS" ] && ! command -v iptables >/dev/null 2>&1 &&
+   uname -r | awk -F'[.-]' '{exit !($1 < 5 || ($1 == 5 && $2 < 13))}'; then
+  if [ "$INIT" = openrc ]; then
+    apk add --no-cache iptables ip6tables >/dev/null 2>&1 || info '没能安装 iptables：老内核上只排除端口本身的进出'
+  else
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y iptables >/dev/null 2>&1 || info '没能安装 iptables：老内核上只排除端口本身的进出'
+  fi
+fi
 # 用 apt 装 xl2tpd 时，系统自带的 xl2tpd 服务会被自动启动，没配任何连接却在公网监听 UDP 1701。
 # 本项目用自己独立的一份 xl2tpd，所以只把这个"没配置、白开着"的系统自带服务停掉并禁用；
 # 如果它的配置里写了任何 [lac]/[lns] 连接（说明有人在用），就完全不动。
@@ -195,10 +262,11 @@ fi
 # 本项目要用：路由表 24680、若干条策略路由优先级、nftables 表 l2tp_vps、网卡名 l2tp-aa、系统用户 l2tp-fetch。
 # 第一次安装时如果发现它们已被别的软件占用，就停下来，绝不清空或覆盖别人的配置。
 # l2tp-fetch 是一个专用的"维护账号"：只有它能在隧道断开时走 VPS 原生网络查 DNS、下载更新。
+# 升级时不重新检查优先级：新版新增的 8906 只在设置排除端口时使用，添加前会先看有没有完全相同的规则。
 if [ ! -f "$STATE/v2-owned" ]; then
   for family in -4 -6; do
     [ -z "$(ip "$family" route show table 24680 2>/dev/null)" ] || fatal '路由表 24680 已被其他软件使用'
-    for pref in 8900 8904 8905 8910 8911 8915 8920 8930; do
+    for pref in 8900 8904 8905 8906 8910 8911 8915 8920 8930; do
       [ -z "$(ip "$family" rule show pref "$pref" 2>/dev/null)" ] || fatal "路由优先级 $pref 已被其他软件使用"
     done
   done
@@ -228,7 +296,7 @@ mkdir -p "$STATE/backups" /usr/local/sbin /usr/local/bin /etc/ppp/ip-up.d /etc/p
 chmod 700 "$STATE" "$STATE/backups"
 BACKUP="$STATE/backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 mkdir "$BACKUP"
-for f in net.env native-v4.txt native-v6.txt server user password installed-version install.sh xl2tpd.conf options v2-owned disabled; do
+for f in net.env native-v4.txt native-v6.txt server user password installed-version install.sh xl2tpd.conf options v2-owned disabled bypass-ports; do
   [ ! -f "$STATE/$f" ] || cp -p "$STATE/$f" "$BACKUP/$f"
 done
 [ ! -f "$RUNTIME" ] || cp -p "$RUNTIME" "$BACKUP/runtime.sh"
@@ -247,22 +315,25 @@ fi
 cat > "$RUNTIME.new" <<'L2TP_RUNTIME_EOF'
 #!/bin/sh
 # L2TP-VPS 管理命令，安装后位于 /usr/local/sbin/l2tp-vps。
-# 常用：sudo l2tp-vps status（看状态）| update（升级）| recover（恢复原生上网）| rollback（回滚）| uninstall（卸载）
+# 常用：sudo l2tp-vps status（看状态）| ports（不走 L2TP 的端口）| update（升级）| recover（恢复原生上网）| rollback（回滚）| uninstall（卸载）
 # 其余子命令（guard、route、up、down、watch……）由开机服务和拨号钩子自动调用，一般不用手动运行。
 #
 # 原理一句话：用"策略路由 + 防火墙"让本机新发起的连接只能走 L2TP 隧道网卡 l2tp-aa；
 # 别人连进来的连接，回包仍从原生网卡发回；隧道断开时，普通程序的新连接被拒绝，而不是偷偷改走原生 IP。
-# 本脚本只改自己的东西：路由表 24680、优先级 8900~8930 的策略规则、nftables 表 l2tp_vps、服务和 l2tp-aa 网卡。
+# 本脚本只改自己的东西：路由表 24680、优先级 8900~8930 的策略规则、nftables 表 l2tp_vps、服务和 l2tp-aa 网卡，
+# 以及设置了排除端口时，内核保留端口（ip_local_reserved_ports）里本项目自己加的那几项。
 set -eu
 trap '' HUP
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 # TABLE：本项目专用路由表。MARK：给"回包"打的标记，带这个标记的包查系统主路由表、从原生网卡出去。
 # TUNMARK：强制进隧道表的标记（保留给兼容用途）。TAG：pppd 的 ipparam 暗号，用来认出本项目的拨号。
+# BYPASS：排除端口的标记。带这个标记的包查主路由表、从原生网卡进出，完全不经过 L2TP（十进制 149122）。
 STATE=/etc/l2tp-vless
 TABLE=24680
 MARK=0x24680
 TUNMARK=0x24681
+BYPASS=0x24682
 PEER=l2tp-aa
 TAG=l2tp-vps
 # load：读取安装时保存的网络信息（原生网卡 NATIVE_IF、原生 IP、服务器 IP 等）。
@@ -278,12 +349,32 @@ ipv6_on() { [ -e /proc/net/if_inet6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/di
 #   output      断线保护的核心，默认拒绝。只放行：本机回环、隧道网卡、其他本地网卡、原生网卡上的回包、
 #               发往 L2TP 服务器的 UDP 1701（隧道本身）、维护账号的 DNS/HTTPS、DHCP 和 IPv6 邻居发现。
 #               其余想从原生网卡出去的新连接一律拒绝，这就是"隧道断了也不会从原生 IP 漏出去"。
+#   forward     转发流量（Docker 容器、wg0 客户端等）的断线保护。output 只管本机自己发出的包，管不到转发。
+#               隧道断开时隧道表里只剩备用原生路由，容器的新连接会选中它、从原生 IP 出去；这里只放行回包
+#               和排除端口的中转流量。
+#   l2tp_bypass_* 排除端口（见下方 bypass_rules 的说明），没设置排除端口时这几条链是空的、不起作用。
 render_firewall() {
   # 只给回包打标记。新连接不打：8920 规则本来就会把它们送进隧道表，再打标记反而会让维护账号的连接被送错地方。
+  bypass_in=; bypass_out=; bypass_nat=; bypass_accept=; bypass_elements=; bypass_cg=
+  if bypass_on; then bypass_rules; fi
+  # flush table 不会清空集合里的旧端口，所以先确保集合存在，再单独清空，最后写入这次的端口。
   cat <<EOF
 add table inet l2tp_vps
 flush table inet l2tp_vps
+add set inet l2tp_vps bypass_ports { type inet_service; flags interval; }
+flush set inet l2tp_vps bypass_ports
 table inet l2tp_vps {
+  set bypass_ports {
+    type inet_service; flags interval;$bypass_elements
+  }
+  chain l2tp_bypass_in {
+    type filter hook prerouting priority mangle; policy accept;$bypass_in
+  }
+  chain l2tp_bypass_out {
+    type route hook output priority mangle; policy accept;$bypass_out
+  }
+  chain l2tp_bypass_cg {$bypass_cg
+  }
   chain l2tp_route {
     type route hook output priority 300; policy accept;
     ct direction reply meta mark set $MARK
@@ -295,7 +386,7 @@ table inet l2tp_vps {
   }
   chain l2tp_nat {
     type nat hook postrouting priority srcnat; policy accept;
-    oifname "$PEER" masquerade
+    oifname "$PEER" masquerade$bypass_nat
   }
   chain output {
     type filter hook output priority 0; policy drop;
@@ -303,7 +394,7 @@ table inet l2tp_vps {
     oifname "$PEER" accept
     # 其他本地网卡（Docker 网桥、内网网卡、wg0）不是原生出口，不拦。
     oifname != "$NATIVE_IF" accept
-    oifname "$NATIVE_IF" ct direction reply ct state established,related accept
+    oifname "$NATIVE_IF" ct direction reply ct state established,related accept$bypass_accept
     oifname "$NATIVE_IF" ip daddr $ENDPOINT udp dport 1701 accept
     oifname "$NATIVE_IF" meta skuid $FETCH_UID udp dport 53 accept
     oifname "$NATIVE_IF" meta skuid $FETCH_UID tcp dport { 53, 443 } accept
@@ -312,8 +403,341 @@ table inet l2tp_vps {
     oifname "$NATIVE_IF" ip6 hoplimit 255 icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
     counter reject with icmpx type admin-prohibited
   }
+  chain forward {
+    type filter hook forward priority 0; policy accept;
+    oifname != "$NATIVE_IF" accept
+    # 别人连进容器（Docker 端口映射）的回包照常放行；排除端口上的中转（BYPASS 标记）照常放行；
+    # 容器自己发起、要从原生网卡出去的一律拒绝。
+    oifname "$NATIVE_IF" ct direction reply ct state established,related accept$bypass_accept
+    counter reject with icmpx type admin-prohibited
+  }
+  # L2TP 只用来出站：别人用 L2TP 出口 IP 连进来的新连接一律丢弃（连本机的和要转发的都算），
+  # 只收本机先发出去的连接的回包。入站只走 VPS 自己的 IP。
+  # 例外：IPv6 自动配置要用的路由器通告、邻居发现和 DHCPv6 回复，不放行的话隧道拿不到 IPv6 地址。
+  chain tunnel_in {
+    type filter hook input priority 0; policy accept;
+    iifname "$PEER" ct state established,related accept
+    iifname "$PEER" icmpv6 type { nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
+    iifname "$PEER" udp sport 547 udp dport 546 accept
+    iifname "$PEER" counter drop
+  }
+  chain tunnel_forward {
+    type filter hook forward priority 0; policy accept;
+    iifname "$PEER" ct state established,related accept
+    iifname "$PEER" counter drop
+  }
 }
 EOF
+}
+# ---------- 排除端口（不走 L2TP 的端口） ----------
+# 用户在 $STATE/bypass-ports 里列出的端口（如 1112、2000-2010），无论跑网站还是节点，都用 VPS 自己的 IP，
+# 和 L2TP 互不影响。分三层实现：
+#   1. 别人连进本机这些端口的连接（包括 Docker 映射、DNAT 中转），整条连接打上 BYPASS 标记，进出都走原生网卡。
+#   2. 本机从这些端口发起的连接（源端口是排除端口），同样打 BYPASS 标记走原生网卡。
+#      这些端口会加进内核的"保留端口"，系统不再把它们随机分给别的程序当源端口：
+#      既不会被 xl2tpd 等程序抢占，别的程序也不会因为碰巧用了这个源端口而绕过 L2TP。
+#   3. 节点转发流量时，出站连接的源端口是随机的，单看端口认不出来。所以找出"正在监听排除端口的系统服务"，
+#      按 cgroup 把这个服务的全部出站都改走原生网卡（见 bypass_scan）。
+#      这个服务如果还监听了别的端口（比如一个 xray 同时跑好几个入站），就不按程序排除，以免把别的端口也带出 L2TP。
+# 带 BYPASS 标记的包查主路由表（规则 8906），防火墙放行，源地址不是原生 IP 的做一次地址伪装。
+# 节点程序也可以自己给某个出站设置 mark 149122（即 0x24682，xray 的 sockopt.mark、sing-box 的 routing_mark），
+# 这个出站同样走原生网络；设置 mark 需要 root 权限，普通程序做不到。没有设置排除端口时，以上全部不生效。
+#
+# normalize_ports：检查并整理用户输入的端口。支持空格、逗号分隔，支持 2000-2010 这样的范围。
+#   输出每行一个端口或端口段，按从小到大排好，重叠或相邻的段会合并。有任何一项不合法就什么都不输出、返回 2。
+#   安装器里有一份完全相同的副本（安装时管理命令还没装好），改动时两处一起改，测试会检查两份一致。
+normalize_ports() {
+  printf '%s\n' "$1" | sed 's/，/ /g; s/[,;]/ /g' | awk '
+    function out(a, b) { print (a == b) ? a : a "-" b }
+    { for (i = 1; i <= NF; i++) {
+        t = $i
+        if (t !~ /^[0-9]+(-[0-9]+)?$/) { bad = 1; exit }
+        n = split(t, p, "-"); a = p[1] + 0; b = (n == 2) ? p[2] + 0 : a
+        if (a < 1 || b > 65535 || a > b) { bad = 1; exit }
+        c++; lo[c] = a; hi[c] = b
+    } }
+    END {
+      if (bad) exit 2
+      for (i = 2; i <= c; i++) {
+        x = lo[i]; y = hi[i]
+        for (j = i - 1; j >= 1 && lo[j] > x; j--) { lo[j + 1] = lo[j]; hi[j + 1] = hi[j] }
+        lo[j + 1] = x; hi[j + 1] = y
+      }
+      for (i = 1; i <= c; i++) {
+        if (m && lo[i] <= e + 1) { if (hi[i] > e) e = hi[i]; continue }
+        if (m) out(s, e)
+        s = lo[i]; e = hi[i]; m = 1
+      }
+      if (m) out(s, e)
+    }'
+}
+# bypass_ports：读出已保存的排除端口（每行一个）。文件被手动改坏时当作没有排除端口：
+#   宁可让这些端口暂时也走 L2TP，也不能让防火墙规则加载失败、断线保护失效。
+bypass_ports() {
+  [ -s "$STATE/bypass-ports" ] || return 0
+  normalize_ports "$(cat "$STATE/bypass-ports")" 2>/dev/null || true
+}
+bypass_on() { [ -n "$(bypass_ports)" ]; }
+# port_list 分隔符：把排除端口连成一行（nft 集合用 ", "，内核保留端口用 ","）。
+port_list() { bypass_ports | awk -v sep="$1" 'NF {printf "%s%s", (n++ ? sep : ""), $1}'; }
+# portset：端口集合运算，参数是逗号分隔的端口/端口段（内核 ip_local_reserved_ports 的格式）。
+#   portset has A B    A 是否包含 B 的全部端口
+#   portset minus A B  输出 A 去掉 B 以后剩下的端口段
+#   portset free A B "起 止"  输出起止范围内既不在 A 也不在 B 里的端口个数
+portset() {
+  awk -v op="$1" -v a="$2" -v b="$3" -v range="${4:-}" '
+    function load(s, set,   n, i, p, x, lo, hi) {
+      n = split(s, p, ",")
+      for (i = 1; i <= n; i++) {
+        gsub(/[^0-9-]/, "", p[i]); if (p[i] == "") continue
+        if (split(p[i], x, "-") == 2) { lo = x[1] + 0; hi = x[2] + 0 } else { lo = p[i] + 0; hi = lo }
+        if (hi > 65535) hi = 65535
+        for (; lo <= hi; lo++) set[lo] = 1
+      }
+    }
+    BEGIN {
+      load(a, A); load(b, B)
+      if (op == "has") { for (k in B) if (!(k in A)) exit 1; exit 0 }
+      if (op == "free") { split(range, e, " "); for (k = e[1] + 0; k <= e[2] + 0; k++) if (!(k in A) && !(k in B)) free++; print free + 0; exit 0 }
+      for (k = 1; k <= 65536; k++) {
+        if (k <= 65535 && (k in A) && !(k in B)) { if (!s) s = k; continue }
+        if (s) { out = out (out == "" ? "" : ",") (s == k - 1 ? s : s "-" (k - 1)); s = 0 }
+      }
+      print out
+    }'
+}
+RESERVED=/proc/sys/net/ipv4/ip_local_reserved_ports
+# reserve_ok：排除端口是否都已在内核保留端口里。没保留成功时不启用"按源端口排除"（见上面第 2 层）。
+reserve_ok() { [ -f "$RESERVED" ] && portset has "$(cat "$RESERVED")" "$(port_list ,)"; }
+# bypass_reserve [release]：把排除端口加进内核保留端口；不再排除的端口从里面删掉。
+#   只删本项目自己加进去的（记在 $STATE/bypass-reserved），别的软件保留的端口原样不动。
+#   release：全部撤掉（recover/卸载时用）。重启后内核会清空这个设置，开机的 guard 会重新加上。
+bypass_reserve() {
+  [ -f "$RESERVED" ] || return 1
+  want=; [ "${1:-}" = release ] || want=$(port_list ,)
+  owned=$(cat "$STATE/bypass-reserved" 2>/dev/null || true)
+  current=$(cat "$RESERVED")
+  release=$(portset minus "$owned" "$want")
+  if [ -n "$release" ]; then
+    current=$(portset minus "$current" "$release")
+    { printf '%s\n' "$current" > "$RESERVED"; } 2>/dev/null || return 1
+    owned=$(portset minus "$owned" "$release")
+    printf '%s\n' "$owned" > "$STATE/bypass-reserved"
+  fi
+  added=$(portset minus "$want" "$current")
+  # 系统随机分配源端口时从"临时端口范围"（默认 32768-60999）里挑。保留太多会让 xl2tpd 和所有程序
+  # 都分不到端口、连不了网，反而把 L2TP 弄坏。所以保留后剩下的临时端口不足 8192 个时就不保留，
+  # 改为不按源端口排除（连进排除端口的连接仍然不走 L2TP）。
+  range=$(cat /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || echo '32768 60999')
+  if [ -n "$added" ] && [ "$(portset free "$current" "$added" "$range")" -lt 8192 ]; then return 1; fi
+  if [ -n "$added" ]; then
+    { printf '%s\n' "${current:+$current,}$added" > "$RESERVED"; } 2>/dev/null || return 1
+    owned=$(portset minus "${owned:+$owned,}$added" '')
+    printf '%s\n' "$owned" > "$STATE/bypass-reserved"
+  fi
+  portset has "$(cat "$RESERVED")" "$want"
+}
+# addresses 文件 字符：读出 native-v4/v6.txt 里的地址，用 ", " 连起来；只保留合法字符，保证防火墙规则能加载。
+addresses() { awk -v ok="$2" '$1 ~ ok {printf "%s%s", (n++ ? ", " : ""), $1}' "$1" 2>/dev/null || true; }
+# bypass_rules：生成 render_firewall 里排除端口相关的规则，存进几个变量。
+bypass_rules() {
+  bypass_elements="
+    elements = { $(port_list ', ') }"
+  # 第 1 层：新连接的目的地址是本机、目的端口是排除端口，就给整条连接打标记（ct mark）；
+  #   之后这条连接来回的每个包都打上 BYPASS，按主路由表走原生网卡。从隧道进来的连接不管。
+  bypass_in="
+    iifname != { \"lo\", \"$PEER\" } ct state new fib daddr type local tcp dport @bypass_ports ct mark set $BYPASS
+    iifname != { \"lo\", \"$PEER\" } ct state new fib daddr type local udp dport @bypass_ports ct mark set $BYPASS
+    ct mark $BYPASS meta mark set $BYPASS"
+  # 本机发出的包：回包照旧交给 l2tp_route；已经判定为排除的连接继续打标记；
+  #   第 2 层按源端口、第 3 层按程序（l2tp_bypass_cg 链由 bypass_refresh 动态填写）。
+  bypass_out="
+    ct direction reply accept
+    ct mark $BYPASS meta mark set $BYPASS accept"
+  if reserve_ok; then
+    bypass_out="$bypass_out
+    tcp sport @bypass_ports ct mark set $BYPASS meta mark set $BYPASS accept
+    udp sport @bypass_ports ct mark set $BYPASS meta mark set $BYPASS accept"
+  fi
+  bypass_out="$bypass_out
+    jump l2tp_bypass_cg"
+  # 本机程序连接时先按隧道表选了隧道地址当源地址，改走原生网卡后要换成原生 IP，否则回包回不来。
+  #   源地址本来就是原生 IP 的（程序自己绑定了某个原生 IP）不改，保留程序选的那个 IP。
+  v4=$(addresses "$STATE/native-v4.txt" '^[0-9.]+$'); [ -n "$v4" ] || v4=$NATIVE_IP
+  v6=$(addresses "$STATE/native-v6.txt" '^[0-9A-Fa-f:]+$')
+  bypass_nat="
+    oifname \"$NATIVE_IF\" meta mark $BYPASS ip saddr != { $v4 } masquerade"
+  if [ -n "$v6" ]; then
+    bypass_nat="$bypass_nat
+    oifname \"$NATIVE_IF\" meta mark $BYPASS ip6 saddr != { $v6 } masquerade"
+  else
+    bypass_nat="$bypass_nat
+    oifname \"$NATIVE_IF\" meta mark $BYPASS meta nfproto ipv6 masquerade"
+  fi
+  bypass_accept="
+    oifname \"$NATIVE_IF\" meta mark $BYPASS accept"
+  # 上次成功装上的按程序排除规则一起写进去，重写防火墙的那一瞬间也不会有空档。
+  # 只接受本项目自己生成的格式；这些规则加载失败时 guard 会不带它们再装一次。
+  if [ -z "${BYPASS_NO_CG:-}" ] && [ -f /run/l2tp-vps-bypass.rules ]; then
+    bypass_cg=$(awk -v mark="$BYPASS" '
+      $0 ~ "^socket cgroupv2 level [0-9]+ \"[A-Za-z0-9._@:/-]+\" ct mark set " mark " meta mark set " mark " accept$" { printf "\n    %s", $0 }' /run/l2tp-vps-bypass.rules)
+  fi
+}
+# bypass_scan：找出正在监听排除端口的程序，判断能不能把这个程序的全部出站改走原生网络。
+# 每行输出一条，字段用 | 分隔：
+#   ok|cgroup 路径|端口                可以按程序排除
+#   skip|cgroup 路径|端口|原因          不能按程序排除（这些端口本身的进出仍然不走 L2TP）
+#   none||原因                          整台机器都不支持按程序排除
+# 只接受独立的系统服务（systemd 的 system.slice 下、或 OpenRC 的服务），不接受 SSH 会话里直接运行的程序：
+# 否则同一个会话里的其他命令（包括本脚本自己）也会被带出 L2TP。
+bypass_scan() {
+  cgroot >/dev/null || { echo 'none||系统没有 cgroup v2（常见于很老的系统或 OpenVZ）'; return 0; }
+  command -v ss >/dev/null 2>&1 || { echo 'none||缺少 ss 命令（iproute2）'; return 0; }
+  range=$(cat /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || echo '32768 60999')
+  ss -lntup 2>/dev/null | awk -v ports="$(port_list ,)" -v range="$range" -v init="$INIT" '
+    function inset(p,   i) { for (i = 1; i <= np; i++) if (p >= lo[i] && p <= hi[i]) return 1; return 0 }
+    # 进程所属的服务：取 cgroup 路径里第一个 .service/.scope（OpenRC 取第一层），
+    # 这样服务自己再分出来的子 cgroup 也算同一个服务。
+    function cgroup(pid,   f, line, path, n, seg, i, up) {
+      if (pid in cg) return cg[pid]
+      f = "/proc/" pid "/cgroup"; path = ""
+      while ((getline line < f) > 0) if (substr(line, 1, 3) == "0::") path = substr(line, 4)
+      close(f)
+      n = split(path, seg, "/"); up = ""
+      if (init != "systemd" && n >= 2 && seg[2] != "") path = "/" seg[2]
+      else for (i = 2; i <= n; i++) { up = up "/" seg[i]; if (seg[i] ~ /\.(service|scope)$/) { path = up; break } }
+      cg[pid] = path; return path
+    }
+    # 返回空字符串表示这个 cgroup 可以排除，否则返回不能排除的原因。
+    function refuse(p,   name) {
+      if (init == "systemd") {
+        if (p !~ /^\/system\.slice\/./) return "程序不是独立的系统服务（例如在 SSH 会话里直接运行）"
+      } else {
+        name = substr(p, 2); sub(/\/.*/, "", name); sub(/^openrc\./, "", name)
+        if (name !~ /^[A-Za-z0-9._@-]+$/ || system("test -f /etc/init.d/" name) != 0) return "程序不是独立的 OpenRC 服务"
+      }
+      if (p !~ /^\/[A-Za-z0-9._@:\/-]+$/) return "服务名里有不支持的字符"
+      if (p ~ /\/(docker|containerd)\.service(\/|$)/ || name ~ /^(docker|containerd)$/) return "Docker 网桥模式的容器无法按程序排除，请改用 host 网络模式"
+      if (p ~ /\/(ssh|sshd|dropbear|cron|crond|xl2tpd|l2tp-vps|l2tp-vps-guard|l2tp-vps-watch)\.service(\/|$)/ || p ~ /\/(sshd|ssh|serial-getty|getty)@/) return "这是系统关键服务"
+      if (name ~ /^(sshd|dropbear|crond|cron|local|xl2tpd|l2tp-vps|l2tp-vps-guard|l2tp-vps-watch)$/) return "这是系统关键服务"
+      return ""
+    }
+    BEGIN {
+      np = split(ports, r, ",")
+      for (i = 1; i <= np; i++) { if (split(r[i], x, "-") == 2) { lo[i] = x[1] + 0; hi[i] = x[2] + 0 } else { lo[i] = r[i] + 0; hi[i] = lo[i] } }
+      split(range, e, " "); elo = e[1] + 0; ehi = e[2] + 0
+    }
+    $1 == "tcp" || $1 == "udp" {
+      port = $5; sub(/.*:/, "", port); port += 0; rest = $0
+      while (match(rest, /pid=[0-9]+/)) {
+        pid = substr(rest, RSTART + 4, RLENGTH - 4); rest = substr(rest, RSTART + RLENGTH)
+        path = cgroup(pid); if (path == "") continue
+        key = path SUBSEP port
+        if (inset(port)) { if (!(key in mine)) { mine[key] = 1; want[path] = want[path] " " port } }
+        # 同一程序的其他端口：TCP 监听都算；UDP 只算临时端口范围以外的
+        # （临时端口范围内的 UDP 多半是程序自己向外发起连接用的随机端口，不是对外服务）。
+        else if (($1 == "tcp" || port < elo || port > ehi) && !(($1 SUBSEP key) in seen)) {
+          seen[$1 SUBSEP key] = 1; other[path] = other[path] " " $1 "/" port
+        }
+      }
+    }
+    END {
+      for (path in want) {
+        why = refuse(path)
+        if (why == "" && other[path] != "") why = "这个程序还在用其他端口：" substr(other[path], 2)
+        if (why == "") print "ok|" path "|" substr(want[path], 2)
+        else print "skip|" path "|" substr(want[path], 2) "|" why
+      }
+    }'
+}
+# cgroot：输出 cgroup v2 的挂载位置。新系统在 /sys/fs/cgroup；Debian 10/Ubuntu 20.04 等较老系统
+#   是"混合模式"，v2 挂在 /sys/fs/cgroup/unified。两处都没有就返回失败。
+cgroot() {
+  for dir in /sys/fs/cgroup /sys/fs/cgroup/unified; do
+    [ -f "$dir/cgroup.controllers" ] && { printf '%s\n' "$dir"; return 0; }
+  done
+  return 1
+}
+# ipt_bypass 路径...：按程序排除的兼容做法，给老内核/低配服务器用。
+#   nftables 要内核 5.13+ 才能按 cgroup 匹配；iptables 的 cgroup 模块在内核 4.5 起就有，混合模式也能用。
+#   只用自己的链 L2TP_VPS_BYPASS（mangle 表，从 OUTPUT 跳进来），给这些服务发起的连接打 BYPASS 标记，
+#   后面的路由、防火墙放行、地址伪装和 nftables 方式完全一样。
+#   不带参数就是清空并撤掉这条链。输出 iptables 也装不上的路径（没装 iptables、或内核缺模块）。
+ipt_bypass() {
+  # 没用过 iptables 方式（大多数新系统）就什么都不碰：只运行 iptables 命令也可能让系统多出一张空表。
+  [ "$#" != 0 ] || [ -f /run/l2tp-vps-bypass.ipt ] || return 0
+  [ "$#" = 0 ] || touch /run/l2tp-vps-bypass.ipt
+  for tool in iptables ip6tables; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      [ "$tool" != iptables ] || [ "$#" = 0 ] || printf '%s\n' "$@"
+      continue
+    fi
+    if [ "$#" = 0 ]; then
+      "$tool" -w -t mangle -D OUTPUT -j L2TP_VPS_BYPASS 2>/dev/null || true
+      "$tool" -w -t mangle -F L2TP_VPS_BYPASS 2>/dev/null || true
+      "$tool" -w -t mangle -X L2TP_VPS_BYPASS 2>/dev/null || true
+      continue
+    fi
+    if ! { "$tool" -w -t mangle -N L2TP_VPS_BYPASS 2>/dev/null || "$tool" -w -t mangle -F L2TP_VPS_BYPASS 2>/dev/null; } ||
+       ! { "$tool" -w -t mangle -C OUTPUT -j L2TP_VPS_BYPASS 2>/dev/null || "$tool" -w -t mangle -I OUTPUT 1 -j L2TP_VPS_BYPASS 2>/dev/null; }; then
+      [ "$tool" != iptables ] || printf '%s\n' "$@"
+      continue
+    fi
+    for path in "$@"; do
+      "$tool" -w -t mangle -A L2TP_VPS_BYPASS -m conntrack --ctdir ORIGINAL -m cgroup --path "${path#/}" -j CONNMARK --set-mark "$BYPASS" 2>/dev/null ||
+        { [ "$tool" = iptables ] && printf '%s\n' "$path"; }
+    done
+    # 整条连接都按排除处理：已打过标记的连接，之后每个包都打上 BYPASS（和 nftables 方式的 ct mark 一样）。
+    "$tool" -w -t mangle -A L2TP_VPS_BYPASS -m conntrack --ctdir ORIGINAL -m connmark --mark "$BYPASS" -j MARK --set-mark "$BYPASS" 2>/dev/null || true
+  done
+  [ "$#" != 0 ] || rm -f /run/l2tp-vps-bypass.ipt
+}
+# bypass_refresh [force]：按 bypass_scan 的结果重写 l2tp_bypass_cg 链。巡检每 3 秒调用一次。
+#   nft 写规则时会把 cgroup 路径换成一个编号；服务重启后编号会变，所以连同编号一起比较，变了就重写。
+#   结果记在 /run/l2tp-vps-bypass.status，供 status/ports 显示。
+bypass_refresh() {
+  if ! bypass_on; then
+    rm -f /run/l2tp-vps-bypass.status /run/l2tp-vps-bypass.sig /run/l2tp-vps-bypass.rules
+    ipt_bypass
+    return 0
+  fi
+  scan=$(bypass_scan)
+  sig=$(printf '%s\n' "$scan" | awk -F'|' '$1 == "ok" {print $2}' | while IFS= read -r path; do
+    printf '%s %s\n' "$path" "$(ls -di "$(cgroot)$path" 2>/dev/null | awk '{print $1}')"
+  done)
+  if [ "${1:-}" != force ] && [ -f /run/l2tp-vps-bypass.sig ] && [ "$sig" = "$(cat /run/l2tp-vps-bypass.sig)" ]; then return 0; fi
+  # 先尝试一次性整体替换；失败（比如某个服务恰好退出了）就逐条添加，加不上的记为失败。
+  batch="flush chain inet l2tp_vps l2tp_bypass_cg"
+  rules=$(printf '%s\n' "$scan" | awk -F'|' -v mark="$BYPASS" '$1 == "ok" {
+    p = substr($2, 2); level = split(p, parts, "/")
+    printf "socket cgroupv2 level %d \"%s\" ct mark set %s meta mark set %s accept\n", level, p, mark, mark }')
+  failed=; good=$rules
+  if ! { printf '%s\n' "$batch"; printf '%s\n' "$rules" | awk 'NF {print "add rule inet l2tp_vps l2tp_bypass_cg " $0}'; } | nft -f - 2>/dev/null; then
+    printf '%s\n' "$batch" | nft -f - 2>/dev/null || return 0
+    good=
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      if printf 'add rule inet l2tp_vps l2tp_bypass_cg %s\n' "$line" | nft -f - 2>/dev/null; then
+        good="$good
+$line"
+      else
+        path=${line#*\"}; failed="$failed /${path%%\"*}"
+      fi
+    done <<EOF
+$rules
+EOF
+  fi
+  # 记下成功装上的规则：guard 重写防火墙时把它们一起写进去，见 bypass_rules。
+  printf '%s\n' "$good" > /run/l2tp-vps-bypass.rules
+  # nftables 装不上的（内核低于 5.13 或 nftables 太旧），改用 iptables 的 cgroup 模块（内核 4.5 起就有）。
+  # shellcheck disable=SC2086
+  still=$(ipt_bypass $failed)
+  {
+    printf '%s\n' "$scan"
+    for path in $still; do printf 'fail|%s\n' "$path"; done
+    reserve_ok || echo 'noreserve||'
+  } > /run/l2tp-vps-bypass.status
+  printf '%s\n' "$sig" > /run/l2tp-vps-bypass.sig
 }
 # rule：添加一条策略路由规则；同优先级下已经有同样的规则就跳过，重复运行也不会越加越多。
 rule() {
@@ -357,7 +781,7 @@ install_native_fallback() {
   # 在隧道表里放一条"备用"原生默认路由（metric 40000，优先级比隧道的 100 低）。
   # 为什么需要：隧道没拨通时，如果隧道表里只有 prohibit（禁止），SSH 回包在打上 MARK 之前就会被路由拒绝，
   #   SSH 会断。有了这条备用路由，回包能先"找到路"，再被打标记从原生网卡发回。
-  # 普通新连接即使选中这条备用路由，也会被上面 output 防火墙拒绝，所以不会漏。
+  # 普通新连接即使选中这条备用路由，也会被上面 output（本机）或 forward（容器等转发）防火墙拒绝，所以不会漏。
   family=$1
   route=$(ip "$family" route show default table main 2>/dev/null | awk -v nic="$NATIVE_IF" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==nic) {print; exit}}')
   [ -n "$route" ] || return 0
@@ -376,6 +800,7 @@ guard() {
   # 4. 加策略规则（数字越小越先匹配）：
   #    8900 维护账号 l2tp-fetch 查主路由表（可以走原生网络，用来查 DNS、下载更新）
   #    8904/8905 带标记的包：TUNMARK 进隧道表，MARK（回包）查主路由表
+  #    8906 排除端口的包（BYPASS 标记）查主路由表，只在设置了排除端口时存在
   #    8911 IPv6 链路本地/组播地址查主表（邻居发现要用原生网卡）
   #    8915 主路由表里的具体网段（Docker 网桥、内网）优先，但忽略主表的默认路由
   #    8920 其余所有流量查隧道表 24680 → 默认出口是 l2tp-aa
@@ -384,7 +809,12 @@ guard() {
   for key in all default "$NATIVE_IF"; do
     sysctl -w "net.ipv4.conf.$key.rp_filter=0" >/dev/null 2>&1 || true
   done
-  render_firewall | nft -f -
+  # 排除端口先加进内核保留端口（失败也继续，只是不启用按源端口排除），再一次性装防火墙。
+  bypass_reserve >/dev/null 2>&1 || true
+  if ! render_firewall | nft -f - 2>/dev/null; then
+    # 多半是某个排除的服务刚好停了、它的 cgroup 已不存在：不带按程序排除的规则再装一次（这次出错会照常报错）。
+    BYPASS_NO_CG=1 render_firewall | nft -f -
+  fi
   copy_link_routes
   ip -4 route replace prohibit default metric 42700 table "$TABLE"
   install_native_fallback -4
@@ -392,6 +822,7 @@ guard() {
   # 8904 排在维护账号规则之后、旧版残留的 8910 规则之前。
   rule -4 8904 "fwmark $TUNMARK lookup $TABLE" fwmark "$TUNMARK" table "$TABLE"
   rule -4 8905 "fwmark $MARK lookup main" fwmark "$MARK" table main
+  bypass_rule -4
   # suppress_prefixlength 0：查主路由表，但忽略其中的默认路由（0.0.0.0/0），只用具体网段。
   rule -4 8915 "lookup main suppress_prefixlength 0" table main suppress_prefixlength 0
   rule -4 8920 "from all lookup $TABLE" table "$TABLE"
@@ -402,6 +833,7 @@ guard() {
     rule -6 8900 "uidrange $FETCH_UID-$FETCH_UID lookup main" uidrange "$FETCH_UID-$FETCH_UID" table main
     rule -6 8904 "fwmark $TUNMARK lookup $TABLE" fwmark "$TUNMARK" table "$TABLE"
     rule -6 8905 "fwmark $MARK lookup main" fwmark "$MARK" table main
+    bypass_rule -6
     # IPv6 邻居发现（相当于 IPv4 的 ARP）必须走原生网卡，普通 IPv6 仍然被挡住。
     rule -6 8911 'to fe80::/10 lookup main' to fe80::/10 table main
     rule -6 8911 'to ff02::/16 lookup main' to ff02::/16 table main
@@ -410,6 +842,16 @@ guard() {
     rule -6 8930 "blackhole" blackhole
   fi
   drop_legacy_source_rules
+  # 防火墙表刚被整体重写，按程序排除的规则要重新填。
+  bypass_refresh force >/dev/null 2>&1 || true
+}
+# bypass_rule 4或6：设置了排除端口就加 8906（BYPASS 标记查主路由表），没设置就删掉它。
+bypass_rule() {
+  if bypass_on; then
+    rule "$1" 8906 "fwmark $BYPASS lookup main" fwmark "$BYPASS" table main
+  else
+    ip "$1" rule del pref 8906 fwmark "$BYPASS" table main 2>/dev/null || true
+  fi
 }
 # endpoint_route：让发往 L2TP 服务器的包走原生网卡（隧道自己必须从原生网络出去），并刷新备用原生路由。
 endpoint_route() {
@@ -542,6 +984,10 @@ policy_missing() {
   ip -4 rule show pref 8915 | grep -q suppress_prefixlength || return 0
   ip -4 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
   ip -4 rule show pref 8930 | grep -q blackhole || return 0
+  if bypass_on; then
+    ip -4 rule show pref 8906 | grep -q "fwmark $BYPASS" || return 0
+    ! ipv6_on || ip -6 rule show pref 8906 | grep -q "fwmark $BYPASS" || return 0
+  fi
   if ipv6_on; then
     ip -6 rule show pref 8900 | grep -q "uidrange $FETCH_UID-$FETCH_UID" || return 0
     ip -6 rule show pref 8904 | grep -q "fwmark $TUNMARK" || return 0
@@ -606,6 +1052,10 @@ watch() {
     sleep 3
     [ ! -f "$STATE/disabled" ] || continue
     tick=$((tick + 3))
+    # 排除端口上的服务可能刚启动或重启过，每 3 秒检查一次，及时把它的出站改走原生网络。
+    if [ -s "$STATE/bypass-ports" ] && [ ! -d /run/l2tp-vps-install.lock ]; then
+      (load; bypass_refresh) >/dev/null 2>&1 || true
+    fi
     # 每 3 秒看一眼防火墙表还在不在：重启 nftables 服务或执行 nft flush ruleset 会把它清掉，
     # 如果此时隧道正好断开，原生网卡就没有保护了。发现丢了立即补回；平时每 15 秒做一次完整巡检。
     if [ "$tick" -lt 15 ] && nft list table inet l2tp_vps >/dev/null 2>&1; then continue; fi
@@ -635,6 +1085,7 @@ remove_routes() {
   ip -4 rule del pref 8900 uidrange "$FETCH_UID-$FETCH_UID" table main 2>/dev/null || true
   ip -4 rule del pref 8904 fwmark "$TUNMARK" table "$TABLE" 2>/dev/null || true
   ip -4 rule del pref 8905 fwmark "$MARK" table main 2>/dev/null || true
+  ip -4 rule del pref 8906 fwmark "$BYPASS" table main 2>/dev/null || true
   drop_legacy_source_rules
   ip -4 rule del pref 8915 table main suppress_prefixlength 0 2>/dev/null || true
   ip -4 rule del pref 8920 table "$TABLE" 2>/dev/null || true
@@ -642,6 +1093,7 @@ remove_routes() {
   ip -6 rule del pref 8900 uidrange "$FETCH_UID-$FETCH_UID" table main 2>/dev/null || true
   ip -6 rule del pref 8904 fwmark "$TUNMARK" table "$TABLE" 2>/dev/null || true
   ip -6 rule del pref 8905 fwmark "$MARK" table main 2>/dev/null || true
+  ip -6 rule del pref 8906 fwmark "$BYPASS" table main 2>/dev/null || true
   ip -6 rule del pref 8911 to fe80::/10 table main 2>/dev/null || true
   ip -6 rule del pref 8911 to ff02::/16 table main 2>/dev/null || true
   ip -6 rule del pref 8915 table main suppress_prefixlength 0 2>/dev/null || true
@@ -709,6 +1161,10 @@ recover() {
   legacy_routes
   restore_dns
   nft delete table inet l2tp_vps 2>/dev/null || true
+  # 撤掉本项目加的内核保留端口；排除端口的设置本身保留，重新安装后继续生效。
+  bypass_reserve release >/dev/null 2>&1 || true
+  ipt_bypass >/dev/null 2>&1 || true
+  rm -f /run/l2tp-vps-bypass.status /run/l2tp-vps-bypass.sig /run/l2tp-vps-bypass.rules
   rm -f /etc/systemd/networkd.conf.d/l2tp-vps.conf /etc/sysctl.d/99-l2tp-vps.conf
   rmdir /etc/systemd/networkd.conf.d 2>/dev/null || true
   printf '%s\n' '已恢复 VPS 原生出站。L2TP 和断线保护已关闭；账号和备份保留。重新运行安装命令可恢复隧道。'
@@ -766,6 +1222,65 @@ rollback() {
   export L2TP_SERVER L2TP_USER L2TP_PASS
   exec sh "$previous/install.sh"
 }
+# bypass_show：用大白话显示排除端口，以及每个端口现在是怎么生效的。
+bypass_show() {
+  if ! bypass_on; then echo '不走 L2TP 的端口：无'; return 0; fi
+  printf '不走 L2TP 的端口：%s\n' "$(port_list ' ')"
+  if [ -f "$STATE/disabled" ]; then echo '  （L2TP 已关闭，整台 VPS 现在都用原生 IP；重新运行安装命令后按上面的端口排除）'; return 0; fi
+  if reserve_ok; then
+    echo '  · 连进这些端口的连接、从这些端口发起的连接：全部走 VPS 原生 IP，不经过 L2TP'
+  else
+    echo '  · 连进这些端口的连接：走 VPS 原生 IP（端口太多或内核不允许保留端口，所以不按源端口排除）'
+  fi
+  if [ ! -f /run/l2tp-vps-bypass.status ]; then echo '  · 按程序排除：巡检服务没在运行，暂无结果'; return 0; fi
+  awk -F'|' -v ports="$(port_list ' ')" '
+    function name(p) { sub(/.*\//, "", p); return p }
+    $1 == "none" { print "  · 按程序排除不可用：" $3 "。只排除端口本身的进出，节点转发的出站仍走 L2TP" }
+    $1 == "ok" { n = split($3, q, " "); for (i = 1; i <= n; i++) seen[q[i]] = 1
+      print "  · 端口 " $3 "：服务 " name($2) " 的全部出站都走 VPS 原生 IP" }
+    $1 == "skip" { n = split($3, q, " "); for (i = 1; i <= n; i++) seen[q[i]] = 1
+      print "  · 端口 " $3 "：服务 " name($2) " 只排除了端口本身的进出，它转发的出站仍走 L2TP"
+      print "      原因：" $4
+      print "      办法：把这个节点单独做成一个只用排除端口的服务，或在节点里给它的出站设置 mark 149122" }
+    $1 == "fail" { print "  · 服务 " name($2) "：按程序排除没装上（需要内核 5.13+ 和 nftables 1.0+，或者装了 iptables 且内核 4.5+），只排除端口本身的进出" }
+    END { n = split(ports, q, " ")
+      for (i = 1; i <= n; i++) if (q[i] !~ /-/ && !(q[i] in seen)) print "  · 端口 " q[i] "：现在没有程序在监听（服务启动后 3 秒内自动识别）" }' /run/l2tp-vps-bypass.status
+  echo '  高级：节点程序给某个出站设置 mark 149122（0x24682），这个出站也走 VPS 原生 IP。'
+}
+# ports：查看或修改不走 L2TP 的端口，立即生效，不用重装。
+#   sudo l2tp-vps ports                 查看；在终端里运行时可以接着输入新的端口
+#   sudo l2tp-vps ports 1112 2000-2010  设置（替换原来的）
+#   sudo l2tp-vps ports 0               清空
+ports_cmd() {
+  if [ "$#" = 0 ]; then
+    bypass_show
+    [ -t 0 ] || return 0
+    printf '输入新的端口替换（多个用空格或逗号分隔，支持 2000-2010；回车不修改，0 表示清空）: '
+    IFS= read -r input || input=
+    [ -n "$input" ] || return 0
+  else
+    input="$*"
+  fi
+  case "$input" in
+    0|none|无) new=;;
+    *) new=$(normalize_ports "$input") && [ -n "$new" ] || fatal "端口格式不对：${input}（只能填 1-65535 的数字，或 2000-2010 这样的范围）";;
+  esac
+  [ ! -d /run/l2tp-vps-install.lock ] || fatal '安装/升级正在进行，请等它结束后再改'
+  if [ -n "$new" ]; then
+    printf '%s\n' "$new" > "$STATE/bypass-ports.new"
+    chmod 600 "$STATE/bypass-ports.new"
+    mv "$STATE/bypass-ports.new" "$STATE/bypass-ports"
+  else
+    rm -f "$STATE/bypass-ports"
+  fi
+  if [ -f "$STATE/disabled" ]; then
+    echo '已保存。L2TP 现在是关闭状态（执行过 recover），重新运行安装命令后生效。'
+    return 0
+  fi
+  guard
+  echo '已生效：'
+  bypass_show
+}
 # status：显示版本、隧道地址、隧道路由表、策略规则和防火墙。
 status() {
   printf '版本：'; cat "$STATE/installed-version" 2>/dev/null || echo '未完成安装'
@@ -773,9 +1288,11 @@ status() {
   printf '出口路由：\n'; ip -4 route show table "$TABLE" 2>/dev/null || true
   printf '策略规则：\n'
   ip -4 rule show pref 8905 2>/dev/null || true
+  ip -4 rule show pref 8906 2>/dev/null || true
   ip -4 rule show pref 8920 2>/dev/null || true
   ip -4 rule show pref 8930 2>/dev/null || true
   printf '防火墙：\n'; nft list table inet l2tp_vps 2>/dev/null || true
+  bypass_show
 }
 # ---------- 命令入口 ----------
 # 下面按第一个参数执行对应功能（不带参数等于 status）。测试会删掉 BEGIN DISPATCH 之后的部分再加载本文件。
@@ -793,7 +1310,8 @@ case "$cmd" in
   fetch) [ "$#" = 2 ] || fatal 'fetch 参数错误'; fetch "$@";;
   resolve) resolve;; refresh) refresh;; watch) watch;;
   recover) recover;; uninstall) uninstall;; update) update;; rollback) rollback;; status) status;;
-  *) fatal '用法：l2tp-vps status | update | rollback | recover | uninstall';;
+  ports) ports_cmd "$@";;
+  *) fatal '用法：l2tp-vps status | ports | update | rollback | recover | uninstall';;
 esac
 L2TP_RUNTIME_EOF
 chmod 700 "$RUNTIME.new"
@@ -838,6 +1356,13 @@ printf '%s\n' "$USER_NAME" > "$STATE/user"
 printf '%s\n' "$PASSWORD" > "$STATE/password"
 touch "$STATE/v2-owned"
 chmod 600 "$STATE/net.env" "$STATE/native-v4.txt" "$STATE/native-v6.txt" "$STATE/server" "$STATE/user" "$STATE/password" "$STATE/v2-owned"
+# 排除端口在打开断线保护（第 13 步的 guard）之前写好，guard 会一次性把它们装进防火墙和路由。
+if [ -n "$BYPASS_PORTS" ]; then
+  printf '%s\n' "$BYPASS_PORTS" > "$STATE/bypass-ports"
+  chmod 600 "$STATE/bypass-ports"
+else
+  rm -f "$STATE/bypass-ports"
+fi
 
 # ---------- 第 9 步：写拨号配置 ----------
 # 本项目用自己独立的一份 xl2tpd 配置和进程，不碰系统自带的 /etc/xl2tpd/xl2tpd.conf，也不改共享的
@@ -1142,11 +1667,22 @@ if [ -n "$v6" ]; then
   v6out=$(printf '%s' "$v6out" | tr -d '[:space:]')
   [ "$v6out" != "$v6" ] || fatal 'IPv6 仍从 VPS 原生地址出去'
 fi
+# 5. 设置了排除端口时：确认防火墙里有排除规则，并且带排除标记的包确实从原生网卡出去、不进隧道。
+#    这里只查路由，不真的拿排除端口去连外网：那样会让这个端口短暂处于 TIME_WAIT，节点可能一时绑定不上。
+if [ -n "$BYPASS_PORTS" ]; then
+  nft list chain inet l2tp_vps l2tp_bypass_in 2>/dev/null | grep -q 'dport @bypass_ports' || fatal '排除端口的防火墙规则没有生效；可运行 sudo l2tp-vps ports 0 清空排除端口后重试'
+  ip -4 rule show pref 8906 2>/dev/null | grep -q 'fwmark 0x24682' || fatal '排除端口的路由规则没有生效；可运行 sudo l2tp-vps ports 0 清空排除端口后重试'
+  ip -4 route get 1.1.1.1 mark 0x24682 2>/dev/null | grep -q "dev $NATIVE_IF" || fatal '排除端口的流量没有走原生网卡；可运行 sudo l2tp-vps ports 0 清空排除端口后重试'
+  nft list chain inet l2tp_vps l2tp_bypass_out 2>/dev/null | grep -q 'sport @bypass_ports' ||
+    info '排除端口太多或内核不允许保留端口（常见于容器 VPS），不按源端口排除；连进排除端口的连接仍走 VPS 原生 IP'
+fi
 # 全部通过：记下版本号，保存这份安装器（以后 rollback 用），打印结果。SUCCESS=1 让 finish 不再报失败。
 printf '%s\n' "$VERSION" > "$STATE/installed-version"
 if [ -f "$0" ]; then cp "$0" "$STATE/install.sh"; chmod 600 "$STATE/install.sh"; fi
 info "安装/升级成功：${VERSION}；公网出口 ${out}，不是 VPS 原生地址"
 info "本机新连接和节点出站都走 L2TP。SSH 与节点端口仍使用 VPS 原地址 ${NATIVE_IP}。"
 info '以后重复运行 README 安装命令，或运行 sudo l2tp-vps update，即可升级并保留账号。'
-info '状态：sudo l2tp-vps status；恢复原生网络：sudo l2tp-vps recover；卸载：sudo shanchu'
+info '状态：sudo l2tp-vps status；不走 L2TP 的端口：sudo l2tp-vps ports；恢复原生网络：sudo l2tp-vps recover；卸载：sudo shanchu'
 SUCCESS=1
+# 最后显示排除端口的生效情况（只是显示，出错也不影响安装结果）。
+if [ -n "$BYPASS_PORTS" ]; then "$RUNTIME" ports </dev/null || true; fi
