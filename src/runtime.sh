@@ -491,7 +491,8 @@ guard() {
   #    8920 其余所有流量查隧道表 24680 → 默认出口是 l2tp-aa
   #    8930 blackhole 兜底，理论上不会走到这里
   # 先装好回包标记，再删旧版规则，保证切换过程中已有的 SSH 不会被送进隧道。
-  for key in all default "$NATIVE_IF"; do
+  # 网卡名里的点（如 VLAN 网卡 eth0.100）在 sysctl 键名里要写成 /，否则设置不到这张网卡上。
+  for key in all default "$(printf '%s' "$NATIVE_IF" | tr . /)"; do
     sysctl -w "net.ipv4.conf.$key.rp_filter=0" >/dev/null 2>&1 || true
   done
   # 排除端口先加进内核保留端口（失败也继续，只是不启用按源端口排除），再一次性装防火墙。
@@ -713,6 +714,7 @@ refresh() (
     chmod 600 "$STATE/net.env.new"
     mv "$STATE/net.env.new" "$STATE/net.env"
     sed "s/^lns = .*/lns = $ENDPOINT/" "$STATE/xl2tpd.conf" > "$STATE/xl2tpd.conf.new"
+    chmod 600 "$STATE/xl2tpd.conf.new"
     mv "$STATE/xl2tpd.conf.new" "$STATE/xl2tpd.conf"
     ip -4 route del "$old/32" table "$TABLE" 2>/dev/null || true
     service restart

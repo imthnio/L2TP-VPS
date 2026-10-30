@@ -191,6 +191,8 @@ elif [ -t 0 ]; then
   done
 fi
 # 检查输入：服务器只允许域名或 IPv4 的字符（字母、数字、点、减号），防止把奇怪内容写进配置。
+# 复制粘贴时常带上首尾空格或 Tab，先去掉，免得明明填对了也报格式错误。
+SERVER=$(printf '%s' "$SERVER" | tr -d ' \t')
 case "$SERVER" in ''|*[!A-Za-z0-9.-]*|-*) fatal '服务器必须是域名或 IPv4';; esac
 # 用户名和密码由服务商决定，允许空格、引号等特殊字符，只禁止换行。
 # 它们不会交给 shell 执行，只会带引号写进 pppd 的配置文件。
@@ -594,6 +596,8 @@ if [ "$(readlink /etc/resolv.conf 2>/dev/null || true)" != /etc/l2tp-vps-resolv.
   fi
   printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\noptions timeout:2 attempts:2\n' > /etc/l2tp-vps-resolv.conf
   chmod 644 /etc/l2tp-vps-resolv.conf
+  # 上次安装若恰好在这两行之间被打断，会留下临时链接，ln 会因为它已存在而失败，所以先删掉。
+  rm -f /etc/resolv.conf.l2tp-vps-new
   ln -s /etc/l2tp-vps-resolv.conf /etc/resolv.conf.l2tp-vps-new
   mv -f /etc/resolv.conf.l2tp-vps-new /etc/resolv.conf
 fi
