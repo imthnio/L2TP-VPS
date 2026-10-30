@@ -387,17 +387,31 @@ ipt_bypass() {
 # bypass_refresh [force]：按 bypass_scan 的结果重写 l2tp_bypass_cg 链。巡检每 3 秒调用一次。
 #   nft 写规则时会把 cgroup 路径换成一个编号；服务重启后编号会变，所以连同编号一起比较，变了就重写。
 #   结果记在 /run/l2tp-vps-bypass.status，供 status/ports 显示。
+#   完整扫描要用 ss -p，它得翻遍所有进程打开的文件，连接多的节点机上每 3 秒做一次很耗 CPU。
+#   所以先用便宜的 listen_sig 看监听端口有没有变化，没变就直接跳过（服务重启会换新的监听，照样能发现）。
 bypass_refresh() {
   if ! bypass_on; then
-    rm -f /run/l2tp-vps-bypass.status /run/l2tp-vps-bypass.sig /run/l2tp-vps-bypass.rules
+    rm -f /run/l2tp-vps-bypass.status /run/l2tp-vps-bypass.sig /run/l2tp-vps-bypass.rules /run/l2tp-vps-bypass.lsig
     ipt_bypass
+    return 0
+  fi
+  lsig=$(listen_sig)
+  if [ "${1:-}" != force ] && [ -n "$lsig" ] && [ -f /run/l2tp-vps-bypass.sig ] &&
+     [ "$lsig" = "$(cat /run/l2tp-vps-bypass.lsig 2>/dev/null)" ]; then
     return 0
   fi
   scan=$(bypass_scan)
   sig=$(printf '%s\n' "$scan" | awk -F'|' '$1 == "ok" {print $2}' | while IFS= read -r path; do
     printf '%s %s\n' "$path" "$(ls -di "$(cgroot)$path" 2>/dev/null | awk '{print $1}')"
   done)
-  if [ "${1:-}" != force ] && [ -f /run/l2tp-vps-bypass.sig ] && [ "$sig" = "$(cat /run/l2tp-vps-bypass.sig)" ]; then return 0; fi
+  # 扫描结果本身也算进去：新启动的服务被拒绝、拒绝原因变了时，按程序排除的规则虽然不用改，
+  # 但 status/ports 显示的结果要跟着更新，否则会一直显示"没有程序在监听"这样的旧信息。
+  sig="$sig
+$scan"
+  if [ "${1:-}" != force ] && [ -f /run/l2tp-vps-bypass.sig ] && [ "$sig" = "$(cat /run/l2tp-vps-bypass.sig)" ]; then
+    printf '%s\n' "$lsig" > /run/l2tp-vps-bypass.lsig
+    return 0
+  fi
   # 先尝试一次性整体替换；失败（比如某个服务恰好退出了）就逐条添加，加不上的记为失败。
   batch="flush chain inet l2tp_vps l2tp_bypass_cg"
   rules=$(printf '%s\n' "$scan" | awk -F'|' -v mark="$BYPASS" '$1 == "ok" {
@@ -430,6 +444,27 @@ EOF
     reserve_ok || echo 'noreserve||'
   } > /run/l2tp-vps-bypass.status
   printf '%s\n' "$sig" > /run/l2tp-vps-bypass.sig
+  printf '%s\n' "$lsig" > /run/l2tp-vps-bypass.lsig
+}
+# listen_sig：列出和排除端口有关的监听（协议、地址端口、socket 编号），排好序。不带 -p，很便宜。
+#   临时端口范围内、又不是排除端口的 UDP 不算：那多半是节点自己向外发起连接用的随机端口，换得很勤，
+#   算进来的话几乎每次都要做完整扫描（bypass_scan 也不把它们当作对外服务）。
+listen_sig() {
+  command -v ss >/dev/null 2>&1 || return 0
+  range=$(cat /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || echo '32768 60999')
+  ss -lntue 2>/dev/null | awk -v ports="$(port_list ,)" -v range="$range" '
+    function inset(p,   i) { for (i = 1; i <= np; i++) if (p >= lo[i] && p <= hi[i]) return 1; return 0 }
+    BEGIN {
+      np = split(ports, r, ",")
+      for (i = 1; i <= np; i++) { if (split(r[i], x, "-") == 2) { lo[i] = x[1] + 0; hi[i] = x[2] + 0 } else { lo[i] = r[i] + 0; hi[i] = lo[i] } }
+      split(range, e, " "); elo = e[1] + 0; ehi = e[2] + 0
+    }
+    $1 == "tcp" || $1 == "udp" {
+      port = $5; sub(/.*:/, "", port); port += 0
+      if ($1 == "udp" && port >= elo && port <= ehi && !inset(port)) next
+      ino = ""; for (i = 6; i <= NF; i++) if ($i ~ /^ino:/) ino = $i
+      print $1, $5, ino
+    }' | sort
 }
 # rule：添加一条策略路由规则；同优先级下已经有同样的规则就跳过，重复运行也不会越加越多。
 rule() {
@@ -887,7 +922,7 @@ recover() {
   # 撤掉本项目加的内核保留端口；排除端口的设置本身保留，重新安装后继续生效。
   bypass_reserve release >/dev/null 2>&1 || true
   ipt_bypass >/dev/null 2>&1 || true
-  rm -f /run/l2tp-vps-bypass.status /run/l2tp-vps-bypass.sig /run/l2tp-vps-bypass.rules
+  rm -f /run/l2tp-vps-bypass.status /run/l2tp-vps-bypass.sig /run/l2tp-vps-bypass.rules /run/l2tp-vps-bypass.lsig
   rm -f /etc/systemd/networkd.conf.d/l2tp-vps.conf /etc/sysctl.d/99-l2tp-vps.conf
   rmdir /etc/systemd/networkd.conf.d 2>/dev/null || true
   printf '%s\n' '已恢复 VPS 原生出站。L2TP 和断线保护已关闭；账号和备份保留。重新运行安装命令可恢复隧道。'
@@ -967,7 +1002,7 @@ bypass_show() {
       print "      办法：把这个节点单独做成一个只用排除端口的服务，或在节点里给它的出站设置 mark 149122" }
     $1 == "fail" { print "  · 服务 " name($2) "：按程序排除没装上（需要内核 5.13+ 和 nftables 1.0+，或者装了 iptables 且内核 4.5+），只排除端口本身的进出" }
     END { n = split(ports, q, " ")
-      for (i = 1; i <= n; i++) if (q[i] !~ /-/ && !(q[i] in seen)) print "  · 端口 " q[i] "：现在没有程序在监听（服务启动后 3 秒内自动识别）" }' /run/l2tp-vps-bypass.status
+      for (i = 1; i <= n; i++) if (q[i] !~ /-/ && !(q[i] in seen)) print "  · 端口 " q[i] "：现在没有程序在监听（服务启动后 3 秒内自动识别；节点若跑在 Docker 网桥模式里，这里看不到它，它的出站仍走 L2TP，请改用 host 网络）" }' /run/l2tp-vps-bypass.status
   echo '  高级：节点程序给某个出站设置 mark 149122（0x24682），这个出站也走 VPS 原生 IP。'
 }
 # ports：查看或修改不走 L2TP 的端口，立即生效，不用重装。
@@ -1010,13 +1045,14 @@ ports_cmd() {
   echo '已生效：'
   bypass_show
 }
-# ensure_iptables：内核低于 5.13 时，nftables 不能按程序排除，要靠 iptables（见 ipt_bypass）。
+# ensure_iptables：内核低于 5.13、或 nftables 低于 1.0 时，nftables 不能按程序排除，要靠 iptables（见 ipt_bypass）。
 #   安装时如果没设排除端口就不会装它，之后用 ports 命令才设置的话，节点出站会一直走 L2TP，所以这里补装。
 #   装不上也继续，只是退回到"只排除端口本身的进出"。
 ensure_iptables() {
   command -v iptables >/dev/null 2>&1 && return 0
-  uname -r | awk -F'[.-]' '{exit !($1 < 5 || ($1 == 5 && $2 < 13))}' || return 0
-  echo '内核低于 5.13，按程序排除需要 iptables，正在安装……'
+  uname -r | awk -F'[.-]' '{exit !($1 < 5 || ($1 == 5 && $2 < 13))}' ||
+    nft --version 2>/dev/null | awk '{v = $2; sub(/^v/, "", v); split(v, a, "."); exit !(a[1] + 0 < 1)}' || return 0
+  echo '内核或 nftables 版本较老，按程序排除需要 iptables，正在安装……'
   if [ "$INIT" = openrc ]; then
     apk add --no-cache iptables ip6tables >/dev/null 2>&1 || echo '没能安装 iptables：只排除端口本身的进出'
   else

@@ -614,6 +614,42 @@ class BypassTests(unittest.TestCase):
         status = (self.d/'run/l2tp-vps-bypass.status').read_text()
         self.assertIn('ok|/system.slice/xray.service|1112', status)
 
+    def test_refresh_skips_the_full_scan_while_listeners_are_unchanged(self):
+        (self.d/'bypass-ports').write_text('1112\n')
+        (self.d/'cgroup/system.slice/xray.service').mkdir(parents=True)
+        setup = (
+            "bypass_scan() { echo SCANNED >&2; echo 'ok|/system.slice/xray.service|1112'; }\n"
+            "nft() { cat >/dev/null; }\n"
+            "listen_sig() { cat \"$STATE/listeners\"; }\n")
+        (self.d/'listeners').write_text('tcp *:1112 ino:1\n')
+        self.assertIn('SCANNED', self.run_sh('bypass_refresh', setup).stderr)
+        self.assertNotIn('SCANNED', self.run_sh('bypass_refresh', setup).stderr)
+        # The service restarted: new socket, so the next tick rescans.
+        (self.d/'listeners').write_text('tcp *:1112 ino:2\n')
+        self.assertIn('SCANNED', self.run_sh('bypass_refresh', setup).stderr)
+        self.assertNotIn('SCANNED', self.run_sh('bypass_refresh', setup).stderr)
+        self.assertIn('SCANNED', self.run_sh('bypass_refresh force', setup).stderr)
+
+    def test_status_follows_a_newly_refused_service(self):
+        (self.d/'bypass-ports').write_text('1112\n')
+        setup = "nft() { cat >/dev/null; }\nlisten_sig() { :; }\nbypass_scan() { cat \"$STATE/scan\"; }\n"
+        (self.d/'scan').write_text('')
+        self.run_sh('bypass_refresh', setup)
+        (self.d/'scan').write_text('skip|/system.slice/x-ui.service|1112|这个程序还在用其他端口：tcp/2053\n')
+        self.run_sh('bypass_refresh', setup)
+        self.assertIn('x-ui.service', (self.d/'run/l2tp-vps-bypass.status').read_text())
+
+    def test_listen_sig_ignores_outbound_udp_but_not_excluded_ports(self):
+        (self.d/'bypass-ports').write_text('51089\n')
+        ss = ("ss() { cat <<'SS'\nNetid State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+              "udp UNCONN 0 0 *:51089 *:* ino:10 sk:1\n"
+              "udp UNCONN 0 0 0.0.0.0:45678 0.0.0.0:* ino:11 sk:2\n"
+              "tcp LISTEN 0 4096 0.0.0.0:22 0.0.0.0:* ino:12 sk:3\nSS\n}\n")
+        out = self.run_sh('listen_sig', ss).stdout
+        self.assertIn('udp *:51089 ino:10', out)
+        self.assertIn('tcp 0.0.0.0:22 ino:12', out)
+        self.assertNotIn('45678', out)
+
     def test_rerender_keeps_known_service_rules_atomically(self):
         (self.d/'bypass-ports').write_text('1112\n')
         (self.d/'run/l2tp-vps-bypass.rules').write_text(

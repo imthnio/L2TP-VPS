@@ -34,7 +34,8 @@ elif cmd=='nslookup':
 elif cmd=='timeout': sys.exit(subprocess.call(args[1:]))
 elif cmd=='su': sys.exit(subprocess.call(['/bin/sh','-c',args[args.index('-c')+1]]))
 elif cmd=='nft':
- if 'list' in args:
+ if args==['--version']: print('nftables v1.0.9 (Old Doc Yak #3)')
+ elif 'list' in args:
   if s.get('guard') and 'chain' in args: print(s.get('rules',''))
   sys.exit(0 if s.get('guard') else 1)
  elif 'delete' in args: s['guard']=False;save()
