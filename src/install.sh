@@ -247,14 +247,16 @@ if [ "$need" = 1 ]; then
   fi
 fi
 for binary in curl ip nft xl2tpd pppd su nslookup timeout; do command -v "$binary" >/dev/null || fatal "缺少 $binary"; done
-# 设置了排除端口、内核又低于 5.13 时，nftables 不能按程序排除，要用 iptables 的兼容方式，没装就补装。
+# 设置了排除端口时，nftables 按程序排除要内核 5.13+ 并且 nftables 1.0+（Debian 11 换了新内核也还是 nft 0.9）。
+# 任何一样不够，就要用 iptables 的兼容方式，没装就补装。
 # 装不上也不影响安装，只是排除端口退回到"只排除端口本身的进出"。
 if [ -n "$BYPASS_PORTS" ] && ! command -v iptables >/dev/null 2>&1 &&
-   uname -r | awk -F'[.-]' '{exit !($1 < 5 || ($1 == 5 && $2 < 13))}'; then
+   { uname -r | awk -F'[.-]' '{exit !($1 < 5 || ($1 == 5 && $2 < 13))}' ||
+     nft --version 2>/dev/null | awk '{v = $2; sub(/^v/, "", v); split(v, a, "."); exit !(a[1] + 0 < 1)}'; }; then
   if [ "$INIT" = openrc ]; then
-    apk add --no-cache iptables ip6tables >/dev/null 2>&1 || info '没能安装 iptables：老内核上只排除端口本身的进出'
+    apk add --no-cache iptables ip6tables >/dev/null 2>&1 || info '没能安装 iptables：只排除端口本身的进出'
   else
-    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y iptables >/dev/null 2>&1 || info '没能安装 iptables：老内核上只排除端口本身的进出'
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y iptables >/dev/null 2>&1 || info '没能安装 iptables：只排除端口本身的进出'
   fi
 fi
 # 用 apt 装 xl2tpd 时，系统自带的 xl2tpd 服务会被自动启动，没配任何连接却在公网监听 UDP 1701。
