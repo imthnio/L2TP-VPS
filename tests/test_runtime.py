@@ -331,6 +331,8 @@ class BypassTests(unittest.TestCase):
             r = self.run_sh('normalize_ports ' + shlex.quote(bad), ok=False)
             self.assertEqual(r.returncode, 2, bad)
             self.assertEqual(r.stdout, '', bad)
+        r = self.run_sh('normalize_ports "36190 27173 49011 510892"', ok=False)
+        self.assertEqual((r.returncode, r.stdout, r.stderr.strip()), (2, '', '510892'))
 
     def test_no_ports_means_no_bypass_rules_at_all(self):
         out = self.run_sh('render_firewall').stdout
@@ -581,6 +583,11 @@ class BypassTests(unittest.TestCase):
             'nft() { cat >/dev/null; }\n')
         r = self.run_sh('ports_cmd 1112,abc', setup, ok=False)
         self.assertNotEqual(r.returncode, 0)
+        self.assertFalse((self.d/'bypass-ports').exists())
+        # A typo in a long list names the one bad entry.
+        r = self.run_sh('ports_cmd "36190、27173、49011、510892"', setup, ok=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('"510892" 不是有效端口', r.stderr)
         self.assertFalse((self.d/'bypass-ports').exists())
         out = self.run_sh('ports_cmd 1112 2000-2010 </dev/null', setup).stdout
         self.assertIn('GUARD', out)
