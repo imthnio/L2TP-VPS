@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y nftables iproute2 curl shellcheck
       - name: Generated installer and shell checks
