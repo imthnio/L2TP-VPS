@@ -118,7 +118,7 @@ nft() { cat >/dev/null; }
     def test_filter_has_no_native_source_blanket_accept(self):
         out=self.run_sh('render_firewall')
         self.assertIn('ct direction reply ct state established,related accept',out)
-        self.assertIn('ct direction reply meta mark set 0x24680',out)
+        self.assertIn('ct direction reply oifname != { "lo", "eth0" } meta mark set 0x24680',out)
         self.assertNotIn('ct direction original meta mark set 0x24681',out)
         self.assertIn('type route hook output',out)
         self.assertIn('masquerade',out)
@@ -424,6 +424,8 @@ class BypassTests(unittest.TestCase):
         self.assertIn('tcp sport @bypass_ports ct mark set 0x24682 meta mark set 0x24682 accept', out)
         # A program's own mark wins over sport and service rules.
         self.assertLess(out.index('meta mark != 0 accept'), out.index('tcp sport @bypass_ports'))
+        # Loopback hops (a node handing traffic to a local gateway) are never re-marked.
+        self.assertLess(out.index('oifname "lo" accept'), out.index('jump l2tp_bypass_cg'))
         self.assertLess(out.index('meta mark != 0 accept'), out.index('jump l2tp_bypass_cg'))
         self.assertIn('jump l2tp_bypass_cg', out)
         self.assertIn('oifname "eth0" meta mark 0x24682 ip saddr != { 192.0.2.10, 192.0.2.11 } masquerade', out)
