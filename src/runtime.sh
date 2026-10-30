@@ -132,7 +132,7 @@ EOF
 #   输出每行一个端口或端口段，按从小到大排好，重叠或相邻的段会合并。有任何一项不合法就什么都不输出、返回 2。
 #   安装器里有一份完全相同的副本（安装时管理命令还没装好），改动时两处一起改，测试会检查两份一致。
 normalize_ports() {
-  printf '%s\n' "$1" | sed 's/，/ /g; s/[,;]/ /g' | awk '
+  printf '%s\n' "$1" | sed 's/，/ /g; s/、/ /g; s/[,;]/ /g' | awk '
     function out(a, b) { print (a == b) ? a : a "-" b }
     { for (i = 1; i <= NF; i++) {
         t = $i
@@ -942,7 +942,7 @@ ports_cmd() {
   if [ "$#" = 0 ]; then
     bypass_show
     [ -t 0 ] || return 0
-    printf '输入新的端口替换（多个用空格或逗号分隔，支持 2000-2010；回车不修改，0 表示清空）: '
+    printf '输入新的端口替换（多个用空格、逗号或顿号分隔，支持 2000-2010；回车不修改，0 表示清空）: '
     IFS= read -r input || input=
     [ -n "$input" ] || return 0
   else

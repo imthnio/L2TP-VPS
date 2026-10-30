@@ -49,14 +49,15 @@ if [ "${#commit}" != 40 ] && fetch "https://github.com/imthnio/L2TP-VPS.git/info
 fi
 [ -n "$commit" ] || { echo '无法确认最新版本（网络错误或 GitHub 限流），未安装缓存旧版' >&2; exit 1; }
 [ "${#commit}" = 40 ] || { echo 'GitHub 未返回有效提交' >&2; exit 1; }
-case "$commit" in *[!0-9a-f]*) exit 1;; esac
+case "$commit" in *[!0-9a-f]*) echo 'GitHub 未返回有效提交' >&2; exit 1;; esac
 for file in install.sh SHA256SUMS; do
   fetch "https://raw.githubusercontent.com/imthnio/L2TP-VPS/$commit/$file" "$tmp/$file" ||
-    fetch "https://cdn.jsdelivr.net/gh/imthnio/L2TP-VPS@$commit/$file" "$tmp/$file" || exit 1
+    fetch "https://cdn.jsdelivr.net/gh/imthnio/L2TP-VPS@$commit/$file" "$tmp/$file" ||
+    { echo "下载 $file 失败（GitHub 和 jsDelivr 都连不上），没有安装，网络和配置都没动。稍后重试" >&2; exit 1; }
 done
 # 从 SHA256SUMS 里取出 install.sh 的正确校验值，和实际下载的文件对比。
 expected=$(awk '$2=="install.sh" {print $1}' "$tmp/SHA256SUMS")
-[ "${#expected}" = 64 ] || exit 1
+[ "${#expected}" = 64 ] || { echo 'SHA256SUMS 内容不对（可能下载到了错误页面），没有执行' >&2; exit 1; }
 actual=$(sha256sum "$tmp/install.sh" | awk '{print $1}')
 [ "$expected" = "$actual" ] || { echo '下载校验失败，没有执行' >&2; exit 1; }
 # sh -n 只检查语法不执行，防止下载到一半的文件被运行。
