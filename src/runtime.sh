@@ -537,7 +537,7 @@ bypass_rule() {
   if bypass_on; then
     rule "$1" 8906 "fwmark $BYPASS lookup main" fwmark "$BYPASS" table main
   else
-    ip "$1" rule del pref 8906 fwmark "$BYPASS" table main 2>/dev/null || true
+    drop_rule "$1" pref 8906 fwmark "$BYPASS" table main
   fi
 }
 # endpoint_route：让发往 L2TP 服务器的包走原生网卡（隧道自己必须从原生网络出去），并刷新备用原生路由。
@@ -767,26 +767,33 @@ stop_services() {
     done
   fi
 }
+# drop_rule 4或6 条件...：删掉一条策略规则，有重复的也一起删掉。
+#   巡检和安装可能同时补规则，偶尔会加出两条一模一样的；只删一次的话，卸载后还会剩一条把流量送进隧道表。
+#   最多删 5 次，防止 ip 命令行为异常时死循环。
+drop_rule() {
+  family=$1; shift; tries=0
+  while [ "$tries" -lt 5 ] && ip "$family" rule del "$@" 2>/dev/null; do tries=$((tries + 1)); done
+}
 remove_routes() {
   # remove_routes：删除本项目加的全部策略规则和隧道表路由。
   # 每条都写完整条件再删，绝不只按优先级删，避免误删别的软件恰好用同一优先级的规则。
-  ip -4 rule del pref 8900 uidrange "$FETCH_UID-$FETCH_UID" table main 2>/dev/null || true
-  ip -4 rule del pref 8904 fwmark "$TUNMARK" table "$TABLE" 2>/dev/null || true
-  ip -4 rule del pref 8905 fwmark "$MARK" table main 2>/dev/null || true
-  ip -4 rule del pref 8906 fwmark "$BYPASS" table main 2>/dev/null || true
+  drop_rule -4 pref 8900 uidrange "$FETCH_UID-$FETCH_UID" table main
+  drop_rule -4 pref 8904 fwmark "$TUNMARK" table "$TABLE"
+  drop_rule -4 pref 8905 fwmark "$MARK" table main
+  drop_rule -4 pref 8906 fwmark "$BYPASS" table main
   drop_legacy_source_rules
-  ip -4 rule del pref 8915 table main suppress_prefixlength 0 2>/dev/null || true
-  ip -4 rule del pref 8920 table "$TABLE" 2>/dev/null || true
-  ip -4 rule del pref 8930 blackhole 2>/dev/null || true
-  ip -6 rule del pref 8900 uidrange "$FETCH_UID-$FETCH_UID" table main 2>/dev/null || true
-  ip -6 rule del pref 8904 fwmark "$TUNMARK" table "$TABLE" 2>/dev/null || true
-  ip -6 rule del pref 8905 fwmark "$MARK" table main 2>/dev/null || true
-  ip -6 rule del pref 8906 fwmark "$BYPASS" table main 2>/dev/null || true
-  ip -6 rule del pref 8911 to fe80::/10 table main 2>/dev/null || true
-  ip -6 rule del pref 8911 to ff02::/16 table main 2>/dev/null || true
-  ip -6 rule del pref 8915 table main suppress_prefixlength 0 2>/dev/null || true
-  ip -6 rule del pref 8920 table "$TABLE" 2>/dev/null || true
-  ip -6 rule del pref 8930 blackhole 2>/dev/null || true
+  drop_rule -4 pref 8915 table main suppress_prefixlength 0
+  drop_rule -4 pref 8920 table "$TABLE"
+  drop_rule -4 pref 8930 blackhole
+  drop_rule -6 pref 8900 uidrange "$FETCH_UID-$FETCH_UID" table main
+  drop_rule -6 pref 8904 fwmark "$TUNMARK" table "$TABLE"
+  drop_rule -6 pref 8905 fwmark "$MARK" table main
+  drop_rule -6 pref 8906 fwmark "$BYPASS" table main
+  drop_rule -6 pref 8911 to fe80::/10 table main
+  drop_rule -6 pref 8911 to ff02::/16 table main
+  drop_rule -6 pref 8915 table main suppress_prefixlength 0
+  drop_rule -6 pref 8920 table "$TABLE"
+  drop_rule -6 pref 8930 blackhole
   ip -4 route show table "$TABLE" dev "$NATIVE_IF" scope link 2>/dev/null | while IFS= read -r line; do
     case "$line" in ''|default*|prohibit*) continue;; esac
     # shellcheck disable=SC2086
