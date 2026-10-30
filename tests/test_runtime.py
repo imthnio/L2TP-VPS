@@ -325,8 +325,8 @@ class BypassTests(unittest.TestCase):
         self.assertEqual(pick(RUNTIME), pick(INSTALL))
 
     def test_parser_accepts_lists_and_ranges_and_rejects_garbage(self):
-        out = self.run_sh('normalize_ports "2000-2010, 1112，3000;2005-2020 1111 001113"').stdout
-        self.assertEqual(out.split(), ['1111-1113', '2000-2020', '3000'])
+        out = self.run_sh('normalize_ports "2000-2010, 1112，3000;2005-2020 1111 001113、4000"').stdout
+        self.assertEqual(out.split(), ['1111-1113', '2000-2020', '3000', '4000'])
         for bad in ['0', '65536', 'abc', '5-3', '1112 x', '-1', '1-2-3', '$(touch x)']:
             r = self.run_sh('normalize_ports ' + shlex.quote(bad), ok=False)
             self.assertEqual(r.returncode, 2, bad)
