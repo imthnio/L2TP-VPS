@@ -143,6 +143,14 @@ nft() { cat >/dev/null; }
             if 'rule del' in line:
                 self.assertTrue('table ' in line or 'blackhole' in line, line)
 
+    def test_cleanup_removes_duplicate_rules(self):
+        # The watcher and the installer can race and add the same rule twice.
+        out=self.run_sh('remove_routes', '''
+dup=2
+ip() { case "$*" in '-4 rule del pref 8920 table 24680') [ "$dup" -gt 0 ] || return 2; dup=$((dup - 1)); echo DEL8920;; esac; }
+''')
+        self.assertEqual(out.count('DEL8920'),2)
+
     def test_uninstall_never_kills_all_ppp_or_purges_packages(self):
         out=self.run_sh('uninstall', '''
 recover() { echo recover; }
