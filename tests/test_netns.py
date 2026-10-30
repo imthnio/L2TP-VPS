@@ -57,6 +57,19 @@ INIT=systemd
         if okay and result.returncode: raise AssertionError(result.stderr)
         if not okay and not result.returncode: raise AssertionError('Unexpected native egress: '+result.stdout)
         return result.stdout.strip()
+    # A plain HTTP GET from a socket carrying an explicit mark (SO_MARK = 36), like WireGuard's fwmark.
+    marked=('import socket,sys\n'
+            's=socket.socket(); s.setsockopt(socket.SOL_SOCKET, 36, int(sys.argv[3], 0)); s.settimeout(3)\n'
+            's.connect((sys.argv[1], int(sys.argv[2]))); s.sendall(b"GET / HTTP/1.0\\r\\nHost: t\\r\\n\\r\\n")\n'
+            'd=b""\n'
+            'while True:\n'
+            ' c=s.recv(65536)\n'
+            ' if not c: break\n'
+            ' d+=c\n'
+            'print(d.split(b"\\r\\n\\r\\n",1)[1].decode())\n')
+    def marked_in_service(mark,host,port):
+        script='echo $$ > '+shlex.quote(str(cgroup_dir/'cgroup.procs'))+'; exec python3 -c "$0" '+host+' '+port+' '+mark
+        return run('nsenter','--net=/run/netns/'+client,'/bin/sh','-c',script,marked).stdout.strip()
     def curl(where,url,*args,okay=True):
         result=ns(where,'curl','--noproxy','*','-g','-fsS','--connect-timeout','1','--max-time','2',*args,url,check=False)
         if okay and result.returncode: raise AssertionError(result.stderr)
@@ -173,6 +186,8 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         assert curl(client,'http://203.0.113.1:18080','--local-port','18090-18099')=='192.0.2.10'
         assert curl_in_service('http://203.0.113.1:18080')=='192.0.2.10'
         assert curl_in_service('http://[2001:db8:1::20]:18082')=='2001:db8:1::10'
+        # A mark the program set itself survives the service exclusion (WireGuard's 51888, here the tunnel mark).
+        assert marked_in_service('0x24681','203.0.113.1','18080')=='198.18.0.1'
         assert curl(server,'http://192.0.2.10:18081')=='192.0.2.20'
         # L2TP is outbound only: nobody may connect in through the tunnel address, excluded port or not.
         curl(server,'http://198.18.0.1:18081',okay=False)
@@ -217,17 +232,8 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         # The direct-route mark works with no excluded ports at all, e.g. WireGuard's fwmark to its landing server.
         # L2TP is down here: an unmarked connection is blocked, a marked one leaves natively with full-size packets.
         assert ns(client,'ip','rule','show','pref','8906').stdout.strip()
-        marked=('import socket,sys\n'
-                's=socket.socket(); s.setsockopt(socket.SOL_SOCKET, 36, 0x24682); s.settimeout(3)\n'
-                's.connect((sys.argv[1], int(sys.argv[2]))); s.sendall(b"GET / HTTP/1.0\\r\\nHost: t\\r\\n\\r\\n")\n'
-                'd=b""\n'
-                'while True:\n'
-                ' c=s.recv(65536)\n'
-                ' if not c: break\n'
-                ' d+=c\n'
-                'print(d.split(b"\\r\\n\\r\\n",1)[1].decode())\n')
         curl(client,'http://203.0.113.1:18080',okay=False)
-        assert ns(client,'python3','-c',marked,'203.0.113.1','18080').stdout.strip()=='192.0.2.10'
+        assert ns(client,'python3','-c',marked,'203.0.113.1','18080','0x24682').stdout.strip()=='192.0.2.10'
         print('PASS: mark 0x24682 leaves natively without any excluded port, while everything else stays blocked')
         ns(client,'ip','rule','add','pref','9000','from','198.51.100.99','table','main')
         ns(client,'ip','route','add','blackhole','198.51.100.0/24','table','100')
