@@ -266,6 +266,16 @@ class LifecycleTests(unittest.TestCase):
  def patch_model(self,**kwargs):
   model=self.model(); model.update(kwargs)
   (self.d/'model.json').write_text(json.dumps(model))
+ def test_install_finishes_when_the_terminal_is_gone(self):
+  # After an SSH drop every write to the terminal fails; /dev/full fails writes the same way.
+  env=self.env.copy()
+  env.update(L2TP_SERVER=' l2tp.example.net ',L2TP_USER='u',L2TP_PASS='p')
+  with open('/dev/full','w') as full:
+   r=subprocess.run(['/bin/sh',str(self.installer)],env=env,stdout=full,stderr=subprocess.PIPE,text=True,errors='replace')
+  self.assertEqual(r.returncode,0,r.stderr)
+  self.assertEqual((self.d/'etc/l2tp-vless/installed-version').read_text().strip(),'2.1.0')
+  # Pasted spaces around the server are dropped rather than rejected.
+  self.assertEqual((self.d/'etc/l2tp-vless/server').read_text(),'l2tp.example.net\n')
  def test_hostname_falls_back_when_system_dns_fails(self):
   (self.d/'model.json').write_text('{"getent_fail":true}')
   self.install()
