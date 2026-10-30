@@ -37,8 +37,10 @@ LEGACY=0
 SUCCESS=0
 BACKUP=
 # fatal 打印错误并退出；info 打印普通进度。
-fatal() { printf '[出错] %s\n' "$*" >&2; exit 1; }
-info() { printf '[L2TP-VPS] %s\n' "$*"; }
+# SSH 断开后终端已关闭，再往屏幕打印会出错；在 set -e 下这会让安装半途退出，上面忽略 HUP 就白做了。
+# 所以打印失败一律忽略，安装照常做完。
+fatal() { printf '[出错] %s\n' "$*" >&2 2>/dev/null || true; exit 1; }
+info() { printf '[L2TP-VPS] %s\n' "$*" 2>/dev/null || true; }
 # ---------- 第 1 步：检查运行环境 ----------
 # 只支持 Linux；必须是 root；Debian/Ubuntu 需要正在运行的 systemd，Alpine 需要 OpenRC。
 [ "$(uname -s)" = Linux ] || fatal '只支持 Linux VPS'
@@ -59,11 +61,13 @@ finish() {
   rmdir /run/l2tp-vps-install.lock 2>/dev/null || true
   if [ "$SUCCESS" != 1 ]; then
     [ "$rc" != 0 ] || rc=1
-    printf '\n安装/升级未完成。没有自动放开普通出站。\n' >&2
-    if [ -x "$RUNTIME" ] && [ -f "$STATE/v2-owned" ]; then
-      printf '恢复原生上网：sudo l2tp-vps recover\n重新升级：sudo l2tp-vps update\n' >&2
-    fi
-    [ -z "$BACKUP" ] || printf '本次备份（含密码，仅 root 可读）：%s\n' "$BACKUP" >&2
+    {
+      printf '\n安装/升级未完成。没有自动放开普通出站。\n'
+      if [ -x "$RUNTIME" ] && [ -f "$STATE/v2-owned" ]; then
+        printf '恢复原生上网：sudo l2tp-vps recover\n重新升级：sudo l2tp-vps update\n'
+      fi
+      [ -z "$BACKUP" ] || printf '本次备份（含密码，仅 root 可读）：%s\n' "$BACKUP"
+    } >&2 2>/dev/null || true
   fi
   exit "$rc"
 }
@@ -79,7 +83,10 @@ if [ -f "$STATE/net.env" ] && [ ! -f "$STATE/v2-owned" ]; then LEGACY=1; fi
 [ ! -f "$STATE/legacy-pending" ] || LEGACY=1
 old_server=; old_user=; old_pass=
 if [ -f "$STATE/password" ]; then
-  old_server=$(cat "$STATE/server"); old_user=$(cat "$STATE/user"); old_pass=$(cat "$STATE/password")
+  # 某个文件缺了（比如上次恰好写到一半）就当作没保存，稍后重新询问，而不是直接报错退出。
+  old_server=$(cat "$STATE/server" 2>/dev/null || true)
+  old_user=$(cat "$STATE/user" 2>/dev/null || true)
+  old_pass=$(cat "$STATE/password")
 elif [ "$LEGACY" = 1 ]; then
   old_server=$(value "$STATE/net.env" SERVER_IP)
   old_user=$(awk '$1=="name" {print $2; exit}' /etc/ppp/options.l2tp-vless 2>/dev/null || true)
@@ -106,7 +113,7 @@ fi
 # 有终端、又没用环境变量指定账号时，给一次重新输入的机会；直接回车仍沿用原账号。
 if [ -f "$STATE/password" ] && [ ! -f "$STATE/installed-version" ] && [ -t 0 ] &&
    [ -z "${L2TP_SERVER:-}${L2TP_USER:-}${L2TP_PASS:-}" ]; then
-  printf '上次安装没有完成。要重新输入服务器、用户名和密码吗？[y/N] '
+  printf '上次安装没有完成（或已经卸载）。要重新输入服务器、用户名和密码吗？[y/N] '
   IFS= read -r redo || redo=
   case "$redo" in y|Y|yes|YES) old_server=; old_user=; old_pass=;; esac
 fi
