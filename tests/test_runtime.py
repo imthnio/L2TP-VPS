@@ -468,6 +468,32 @@ class BypassTests(unittest.TestCase):
         self.assertIn('-4 rule add pref 8906 fwmark 0x24682 table main', out)
         self.assertLess(out.index('pref 8906'), out.index('pref 8920'))
 
+    def test_reserved_ports_route_natively_from_the_first_lookup(self):
+        # Without this, sockets on excluded ports pick the tunnel route (MTU 1400) and every packet is rerouted.
+        (self.d/'bypass-ports').write_text('1112\n2000-2010\n')
+        self.reserved()
+        out = self.run_sh('guard', GUARD_STUBS).stdout
+        self.assertIn('-4 rule add pref 8907 sport 1112 table main', out)
+        self.assertIn('-4 rule add pref 8907 sport 2000-2010 table main', out)
+        self.assertLess(out.index('pref 8907'), out.index('pref 8920'))
+
+    def test_source_port_route_needs_reserved_ports(self):
+        (self.d/'bypass-ports').write_text('33000-60000\n')
+        self.reserved()
+        self.assertNotIn('pref 8907', self.run_sh('guard', GUARD_STUBS).stdout)
+
+    def test_stale_source_port_routes_are_removed(self):
+        (self.d/'bypass-ports').write_text('1112\n')
+        self.reserved('1112')
+        rules = '''ip() { case "$*" in '-4 rule show pref 8907') printf '%s\\n' '8907: from all sport 1112 lookup main' '8907: from all sport 3000-3001 lookup main';; *) printf 'IP %s\\n' "$*";; esac; }
+'''
+        out = self.run_sh('bypass_sport_rule -4', rules).stdout
+        self.assertIn('-4 rule del pref 8907 sport 3000-3001 table main', out)
+        self.assertNotIn('sport 1112 table main', out)
+        out = self.run_sh('remove_routes', rules).stdout
+        self.assertIn('-4 rule del pref 8907 sport 1112 table main', out)
+        self.assertIn('-4 rule del pref 8907 sport 3000-3001 table main', out)
+
     def test_cleanup_removes_bypass_route_rule(self):
         out = self.run_sh('remove_routes').stdout
         self.assertIn('-4 rule del pref 8906 fwmark 0x24682 table main', out)

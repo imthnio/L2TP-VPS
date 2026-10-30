@@ -283,7 +283,7 @@ fi
 if [ ! -f "$STATE/v2-owned" ]; then
   for family in -4 -6; do
     [ -z "$(ip "$family" route show table 24680 2>/dev/null)" ] || fatal '路由表 24680 已被其他软件使用'
-    for pref in 8900 8904 8905 8906 8910 8911 8915 8920 8930; do
+    for pref in 8900 8904 8905 8906 8907 8910 8911 8915 8920 8930; do
       [ -z "$(ip "$family" rule show pref "$pref" 2>/dev/null)" ] || fatal "路由优先级 $pref 已被其他软件使用"
     done
   done
@@ -831,6 +831,7 @@ guard() {
   #    8900 维护账号 l2tp-fetch 查主路由表（可以走原生网络，用来查 DNS、下载更新）
   #    8904/8905 带标记的包：TUNMARK 进隧道表，MARK（回包）查主路由表
   #    8906 排除端口的包（BYPASS 标记）查主路由表，只在设置了排除端口时存在
+  #    8907 源端口是排除端口的包查主路由表（见 bypass_sport_rule），只在排除端口已保留时存在
   #    8911 IPv6 链路本地/组播地址查主表（邻居发现要用原生网卡）
   #    8915 主路由表里的具体网段（Docker 网桥、内网）优先，但忽略主表的默认路由
   #    8920 其余所有流量查隧道表 24680 → 默认出口是 l2tp-aa
@@ -883,6 +884,25 @@ bypass_rule() {
   else
     drop_rule "$1" pref 8906 fwmark "$BYPASS" table main
   fi
+  bypass_sport_rule "$1"
+}
+# bypass_sport_rule 4或6 [release]：8907 让源端口是排除端口的包从一开始就查主路由表。
+#   为什么需要：8906 只认防火墙打的标记，可程序选路（TCP 回 SYN-ACK、UDP 发包）发生在打标记之前，
+#   当时查的是隧道表，选中的是 l2tp-aa：连接按隧道的 MTU 1400 定 MSS、按隧道的 GSO 能力切包，
+#   之后每个包都要被防火墙改标记、重新选路一次才转到原生网卡。排除端口上的网站和节点因此明显变慢。
+#   有了这条规则，监听排除端口的程序回包时直接选中原生网卡，按原生 MTU 1500 收发，不再逐包重新选路。
+#   只在排除端口已加进内核保留端口时启用（和第 2 层同一前提）：否则别的程序碰巧随机用到这个源端口时，
+#   会被送去原生网卡、再被断线保护拒绝，连不上网。内核或 ip 命令太旧（4.17 以前）不支持 sport 时跳过，
+#   退回到原来逐包重新选路的做法，功能不受影响。
+bypass_sport_rule() {
+  family=$1; keep=
+  if [ "${2:-}" != release ] && bypass_on && reserve_ok; then keep=$(bypass_ports); fi
+  ip "$family" rule show pref 8907 2>/dev/null | awk '/lookup main/ {for (i = 1; i < NF; i++) if ($i == "sport") print $(i + 1)}' | while IFS= read -r port; do
+    printf '%s\n' "$keep" | grep -Fx -- "$port" >/dev/null || drop_rule "$family" pref 8907 sport "$port" table main
+  done
+  for port in $keep; do
+    rule "$family" 8907 "sport $port lookup main" sport "$port" table main 2>/dev/null || true
+  done
 }
 # endpoint_route：让发往 L2TP 服务器的包走原生网卡（隧道自己必须从原生网络出去），并刷新备用原生路由。
 endpoint_route() {
@@ -1133,6 +1153,8 @@ remove_routes() {
   drop_rule -6 pref 8904 fwmark "$TUNMARK" table "$TABLE"
   drop_rule -6 pref 8905 fwmark "$MARK" table main
   drop_rule -6 pref 8906 fwmark "$BYPASS" table main
+  bypass_sport_rule -4 release
+  bypass_sport_rule -6 release
   drop_rule -6 pref 8911 to fe80::/10 table main
   drop_rule -6 pref 8911 to ff02::/16 table main
   drop_rule -6 pref 8915 table main suppress_prefixlength 0
