@@ -490,6 +490,24 @@ class BypassTests(unittest.TestCase):
                           {101: '/system.slice/xray.service', 7: '/system.slice/ssh.service'})
         self.assertEqual(lines, ['ok|/system.slice/xray.service|1112'])
 
+    def test_scan_ignores_loopback_only_ports(self):
+        # xray API, sing-box clash_api and 3x-ui's internal port listen only on loopback; nothing outside can reach them.
+        lines = self.scan('tcp LISTEN 0 4096 *:1112 *:* users:(("xray",pid=101,fd=3))\n'
+                          'tcp LISTEN 0 4096 127.0.0.1:10085 0.0.0.0:* users:(("xray",pid=101,fd=4))\n'
+                          'tcp LISTEN 0 4096 [::1]:9090 [::]:* users:(("xray",pid=101,fd=5))\n'
+                          'tcp LISTEN 0 4096 [::ffff:127.0.0.1]:62789 *:* users:(("xray",pid=101,fd=6))\n'
+                          'udp UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:* users:(("xray",pid=101,fd=7))',
+                          {101: '/system.slice/xray.service'})
+        self.assertEqual(lines, ['ok|/system.slice/xray.service|1112'])
+        # A public second port still blocks it: that node is meant to keep using L2TP.
+        lines = self.scan('tcp LISTEN 0 4096 *:1112 *:* users:(("xray",pid=101,fd=3))\n'
+                          'tcp LISTEN 0 4096 127.0.0.1:10085 0.0.0.0:* users:(("xray",pid=101,fd=4))\n'
+                          'tcp LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("xray",pid=101,fd=5))',
+                          {101: '/system.slice/xray.service'})
+        self.assertTrue(lines[0].startswith('skip|'), lines)
+        self.assertIn('tcp/443', lines[0])
+        self.assertNotIn('10085', lines[0])
+
     def test_scan_groups_sub_cgroups_under_their_service(self):
         lines = self.scan('tcp LISTEN 0 4096 *:1112 *:* users:(("panel",pid=110,fd=3))\n'
                           'tcp LISTEN 0 4096 *:8443 *:* users:(("xray",pid=111,fd=3))',

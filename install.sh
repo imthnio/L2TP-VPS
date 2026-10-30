@@ -653,14 +653,18 @@ bypass_scan() {
     }
     $1 == "tcp" || $1 == "udp" {
       port = $5; sub(/.*:/, "", port); port += 0; rest = $0
+      # 只在本机内部监听（127.0.0.1、::1）的端口，外面连不进来，不可能是对外的节点，比如 xray 的 API、
+      # sing-box 的 clash_api、3x-ui 内部用的端口。几乎每个节点程序都有一个，不能因为它就拒绝按程序排除。
+      addr = $5; sub(/:[^:]*$/, "", addr)
+      loop = (addr ~ /^127\./ || addr ~ /^\[::1\]/ || addr ~ /^\[::ffff:127\./ || addr ~ /%lo$/)
       while (match(rest, /pid=[0-9]+/)) {
         pid = substr(rest, RSTART + 4, RLENGTH - 4); rest = substr(rest, RSTART + RLENGTH)
         path = cgroup(pid); if (path == "") continue
         key = path SUBSEP port
         if (inset(port)) { if (!(key in mine)) { mine[key] = 1; want[path] = want[path] " " port } }
-        # 同一程序的其他端口：TCP 监听都算；UDP 只算临时端口范围以外的
-        # （临时端口范围内的 UDP 多半是程序自己向外发起连接用的随机端口，不是对外服务）。
-        else if (($1 == "tcp" || port < elo || port > ehi) && !(($1 SUBSEP key) in seen)) {
+        # 同一程序的其他对外端口：TCP 监听都算；UDP 只算临时端口范围以外的
+        # （临时端口范围内的 UDP 多半是程序自己向外发起连接用的随机端口，不是对外服务）；只听本机的不算。
+        else if (!loop && ($1 == "tcp" || port < elo || port > ehi) && !(($1 SUBSEP key) in seen)) {
           seen[$1 SUBSEP key] = 1; other[path] = other[path] " " $1 "/" port
         }
       }
@@ -1315,9 +1319,23 @@ ports_cmd() {
     echo '已保存。L2TP 现在是关闭状态（执行过 recover），重新运行安装命令后生效。'
     return 0
   fi
+  [ -z "$new" ] || ensure_iptables
   guard
   echo '已生效：'
   bypass_show
+}
+# ensure_iptables：内核低于 5.13 时，nftables 不能按程序排除，要靠 iptables（见 ipt_bypass）。
+#   安装时如果没设排除端口就不会装它，之后用 ports 命令才设置的话，节点出站会一直走 L2TP，所以这里补装。
+#   装不上也继续，只是退回到"只排除端口本身的进出"。
+ensure_iptables() {
+  command -v iptables >/dev/null 2>&1 && return 0
+  uname -r | awk -F'[.-]' '{exit !($1 < 5 || ($1 == 5 && $2 < 13))}' || return 0
+  echo '内核低于 5.13，按程序排除需要 iptables，正在安装……'
+  if [ "$INIT" = openrc ]; then
+    apk add --no-cache iptables ip6tables >/dev/null 2>&1 || echo '没能安装 iptables：只排除端口本身的进出'
+  else
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y iptables >/dev/null 2>&1 || echo '没能安装 iptables：只排除端口本身的进出'
+  fi
 }
 # status：显示版本、隧道地址、隧道路由表、策略规则和防火墙。
 status() {
