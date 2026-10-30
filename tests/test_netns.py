@@ -47,7 +47,8 @@ INIT=systemd
 '''
     def runtime(body): return ns(client,'/bin/sh','-c',prefix+body)
     # ip netns exec remounts /sys and hides the cgroup tree; nft needs it to resolve a service's cgroup path.
-    cgroup_dir=Path('/sys/fs/cgroup')/('l2vp-'+suffix)
+    # The name carries a systemd-style escape, like system-hysteria\\x2dnode.slice, which nft must accept as is.
+    cgroup_dir=Path('/sys/fs/cgroup')/('l2vp\\x2d'+suffix)
     def runtime_mounts(body): return run('nsenter','--net=/run/netns/'+client,'/bin/sh','-c',prefix+body)
     def curl_in_service(url,okay=True):
         # Stands in for a node running as its own service: the shell joins the cgroup, then execs curl.
@@ -160,7 +161,7 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         # Excluded ports: their traffic avoids L2TP completely, and nothing else may.
         cgroup_dir.mkdir()
         (d/'bypass-ports').write_text('18081\n18090-18099\n')
-        runtime_mounts("bypass_scan() { echo 'ok|/"+cgroup_dir.name+"|18081'; }\nguard")
+        runtime_mounts("bypass_scan() { printf '%s\\n' 'ok|/"+cgroup_dir.name+"|18081'; }\nguard")
         table=ns(client,'nft','list','table','inet','l2tp_vps').stdout
         assert 'socket cgroupv2' in table and 'sport @bypass_ports' in table, table
         assert '18090-18099' in ns(client,'cat','/proc/sys/net/ipv4/ip_local_reserved_ports').stdout
@@ -177,18 +178,18 @@ Server((sys.argv[1],int(sys.argv[2])),Handler).serve_forever()
         curl(server,'http://198.18.0.1:18081',okay=False)
         curl(server,'http://198.18.0.1:18083',okay=False)
         # Old kernels: nft cannot match the service, so iptables' cgroup match takes over.
-        run('nsenter','--net=/run/netns/'+client,'/bin/sh','-c',prefix.replace(str(library),str(old_kernel))+"bypass_scan() { echo 'ok|/"+cgroup_dir.name+"|18081'; }\nguard")
+        run('nsenter','--net=/run/netns/'+client,'/bin/sh','-c',prefix.replace(str(library),str(old_kernel))+"bypass_scan() { printf '%s\\n' 'ok|/"+cgroup_dir.name+"|18081'; }\nguard")
         assert 'cgroupv2' not in ns(client,'nft','list','table','inet','l2tp_vps').stdout
         assert 'L2TP_VPS_BYPASS' in ns(client,'iptables','-t','mangle','-S').stdout
         assert curl_in_service('http://203.0.113.1:18080')=='192.0.2.10'
         assert curl(client,'http://203.0.113.1:18080')=='198.18.0.1'
-        runtime_mounts("bypass_scan() { echo 'ok|/"+cgroup_dir.name+"|18081'; }\nguard")
+        runtime_mounts("bypass_scan() { printf '%s\\n' 'ok|/"+cgroup_dir.name+"|18081'; }\nguard")
         assert 'L2TP_VPS_BYPASS' not in ns(client,'iptables','-t','mangle','-S').stdout
         assert curl_in_service('http://203.0.113.1:18080')=='192.0.2.10'
         print('PASS: the tunnel address accepts no inbound connections; old kernels exclude services through iptables')
         # A DNAT relay on a non-excluded port goes through the tunnel; on an excluded port it leaves natively.
         assert curl(server,'http://192.0.2.10:18120')=='198.18.0.1'
-        runtime_mounts("bypass_scan() { echo 'ok|/"+cgroup_dir.name+"|18081'; }\nprintf '18081\\n18090-18099\\n18120\\n' > \"$STATE/bypass-ports\"; guard")
+        runtime_mounts("bypass_scan() { printf '%s\\n' 'ok|/"+cgroup_dir.name+"|18081'; }\nprintf '18081\\n18090-18099\\n18120\\n' > \"$STATE/bypass-ports\"; guard")
         assert curl(server,'http://192.0.2.10:18120')=='192.0.2.10'
         print('PASS: excluded ports, their source ports and their service use the native IP; all other traffic stays in L2TP')
         ns(client,'ip','link','delete','l2tp-aa') # Hard loss, without ip-down hook.

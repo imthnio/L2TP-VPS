@@ -508,6 +508,17 @@ class BypassTests(unittest.TestCase):
         self.assertIn('tcp/443', lines[0])
         self.assertNotIn('10085', lines[0])
 
+    def test_scan_accepts_systemd_escaped_template_services(self):
+        # hysteria-node@3.service lives in system-hysteria\x2dnode.slice: systemd escapes '-' in slice names.
+        path = '/system.slice/system-hysteria\\x2dnode.slice/hysteria-node@3.service'
+        lines = self.scan('udp UNCONN 0 0 *:51089 *:* users:(("hysteria",pid=120,fd=3))', {120: path}, ports='51089')
+        self.assertEqual(lines, ['ok|' + path + '|51089'])
+        rule = 'socket cgroupv2 level 3 "' + path[1:] + '" ct mark set 0x24682 meta mark set 0x24682 accept'
+        (self.d/'bypass-ports').write_text('51089\n')
+        (self.d/'run/l2tp-vps-bypass.rules').write_text(rule + '\n')
+        cg = self.run_sh('render_firewall').stdout.split('chain l2tp_bypass_cg {', 1)[1].split('}', 1)[0]
+        self.assertIn(rule, cg)
+
     def test_scan_groups_sub_cgroups_under_their_service(self):
         lines = self.scan('tcp LISTEN 0 4096 *:1112 *:* users:(("panel",pid=110,fd=3))\n'
                           'tcp LISTEN 0 4096 *:8443 *:* users:(("xray",pid=111,fd=3))',
@@ -536,7 +547,9 @@ class BypassTests(unittest.TestCase):
                  '/system.slice/ssh.service': '关键服务',
                  '/system.slice/l2tp-vps.service': '关键服务',
                  '/system.slice/docker.service': 'Docker',
-                 '/system.slice/bad\\x2dname.service': '不支持的字符'}
+                 '/system.slice/bad\\name.service': '不支持的字符',
+                 '/system.slice/bad"name.service': '不支持的字符',
+                 '/system.slice/bad\\x2zname.service': '不支持的字符'}
         for path, why in cases.items():
             lines = self.scan('tcp LISTEN 0 4096 *:1112 *:* users:(("p",pid=200,fd=3))', {200: path})
             self.assertEqual(len(lines), 1, path)

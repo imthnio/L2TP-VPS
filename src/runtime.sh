@@ -266,7 +266,7 @@ bypass_rules() {
   # 只接受本项目自己生成的格式；这些规则加载失败时 guard 会不带它们再装一次。
   if [ -z "${BYPASS_NO_CG:-}" ] && [ -f /run/l2tp-vps-bypass.rules ]; then
     bypass_cg=$(awk -v mark="$BYPASS" '
-      $0 ~ "^socket cgroupv2 level [0-9]+ \"[A-Za-z0-9._@:/-]+\" ct mark set " mark " meta mark set " mark " accept$" { printf "\n    %s", $0 }' /run/l2tp-vps-bypass.rules)
+      $0 ~ "^socket cgroupv2 level [0-9]+ \"([A-Za-z0-9._@:/-]|\\\\x[0-9A-Fa-f][0-9A-Fa-f])+\" ct mark set " mark " meta mark set " mark " accept$" { printf "\n    %s", $0 }' /run/l2tp-vps-bypass.rules)
   fi
 }
 # bypass_scan：找出正在监听排除端口的程序，判断能不能把这个程序的全部出站改走原生网络。
@@ -302,7 +302,9 @@ bypass_scan() {
         name = substr(p, 2); sub(/\/.*/, "", name); sub(/^openrc\./, "", name)
         if (name !~ /^[A-Za-z0-9._@-]+$/ || system("test -f /etc/init.d/" name) != 0) return "程序不是独立的 OpenRC 服务"
       }
-      if (p !~ /^\/[A-Za-z0-9._@:\/-]+$/) return "服务名里有不支持的字符"
+      # systemd 会把服务名里的特殊字符写成 \x2d 这样的转义（例如模板服务 hysteria-node@3 所在的
+      # system-hysteria\x2dnode.slice），这种转义也要接受；除此之外的反斜杠、引号、空格一律拒绝。
+      if (p !~ /^\/([A-Za-z0-9._@:\/-]|\\x[0-9A-Fa-f][0-9A-Fa-f])+$/) return "服务名里有不支持的字符"
       if (p ~ /\/(docker|containerd)\.service(\/|$)/ || name ~ /^(docker|containerd)$/) return "Docker 网桥模式的容器无法按程序排除，请改用 host 网络模式"
       if (p ~ /\/(ssh|sshd|dropbear|cron|crond|xl2tpd|l2tp-vps|l2tp-vps-guard|l2tp-vps-watch)\.service(\/|$)/ || p ~ /\/(sshd|ssh|serial-getty|getty)@/) return "这是系统关键服务"
       if (name ~ /^(sshd|dropbear|crond|cron|local|xl2tpd|l2tp-vps|l2tp-vps-guard|l2tp-vps-watch)$/) return "这是系统关键服务"
