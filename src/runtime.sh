@@ -64,7 +64,9 @@ table inet l2tp_vps {
   }
   chain l2tp_route {
     type route hook output priority 300; policy accept;
-    ct direction reply meta mark set $MARK
+    # 第一次选路已经走原生网卡（排除端口靠 8907、隧道断开时的备用路由、同网段）或本机回环的回包不用再改：
+    # 改标记会让内核把每个包重新选一次路，大流量（节点回给客户端的下载方向）白白多花一份力气。
+    ct direction reply oifname != { "lo", "$NATIVE_IF" } meta mark set $MARK
   }
   chain l2tp_bridge {
     # 从 Docker 网桥、wg0 等网卡转发过来的回包，按原路返回（查主路由表）。
@@ -241,12 +243,14 @@ bypass_rules() {
     iifname != { \"lo\", \"$PEER\" } ct state new fib daddr type local tcp dport @bypass_ports ct mark set $BYPASS
     iifname != { \"lo\", \"$PEER\" } ct state new fib daddr type local udp dport @bypass_ports ct mark set $BYPASS
     ct mark $BYPASS meta mark set $BYPASS"
-  # 本机发出的包：回包照旧交给 l2tp_route；程序自己已经设了标记的包原样放过；已经判定为排除的连接继续打标记；
+  # 本机发出的包：回包照旧交给 l2tp_route；发往本机回环的不管（比如节点把流量交给本机的 WireGuard 网关，
+  #   打标记只会让每个包多选一次路）；程序自己已经设了标记的包原样放过；已经判定为排除的连接继续打标记；
   #   第 2 层按源端口、第 3 层按程序（l2tp_bypass_cg 链由 bypass_refresh 动态填写）。
   #   程序自己设的标记要保留：比如 WireGuard 落地脚本让节点的某些出站带 51888 进 WireGuard，
   #   节点又刚好在排除端口上被按程序排除时，覆盖成 BYPASS 会让这些流量改走 VPS 原生 IP、不去落地机。
   bypass_out="
     ct direction reply accept
+    oifname \"lo\" accept
     meta mark != 0 accept
     ct mark $BYPASS meta mark set $BYPASS accept"
   if reserve_ok; then
