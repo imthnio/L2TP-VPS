@@ -128,21 +128,22 @@ EOF
 # 节点程序也可以自己给某个出站设置 mark 149122（即 0x24682，xray 的 sockopt.mark、sing-box 的 routing_mark），
 # 这个出站同样走原生网络；设置 mark 需要 root 权限，普通程序做不到。没有设置排除端口时，以上全部不生效。
 #
-# normalize_ports：检查并整理用户输入的端口。支持空格、逗号分隔，支持 2000-2010 这样的范围。
-#   输出每行一个端口或端口段，按从小到大排好，重叠或相邻的段会合并。有任何一项不合法就什么都不输出、返回 2。
+# normalize_ports：检查并整理用户输入的端口。支持空格、逗号、顿号分隔，支持 2000-2010 这样的范围。
+#   输出每行一个端口或端口段，按从小到大排好，重叠或相邻的段会合并。有任何一项不合法就什么都不输出、
+#   把这一项打印到 stderr（方便告诉用户错在哪），返回 2。
 #   安装器里有一份完全相同的副本（安装时管理命令还没装好），改动时两处一起改，测试会检查两份一致。
 normalize_ports() {
   printf '%s\n' "$1" | sed 's/，/ /g; s/、/ /g; s/[,;]/ /g' | awk '
     function out(a, b) { print (a == b) ? a : a "-" b }
     { for (i = 1; i <= NF; i++) {
         t = $i
-        if (t !~ /^[0-9]+(-[0-9]+)?$/) { bad = 1; exit }
+        if (t !~ /^[0-9]+(-[0-9]+)?$/) { bad = t; exit }
         n = split(t, p, "-"); a = p[1] + 0; b = (n == 2) ? p[2] + 0 : a
-        if (a < 1 || b > 65535 || a > b) { bad = 1; exit }
+        if (a < 1 || b > 65535 || a > b) { bad = t; exit }
         c++; lo[c] = a; hi[c] = b
     } }
     END {
-      if (bad) exit 2
+      if (bad != "") { print bad > "/dev/stderr"; exit 2 }
       for (i = 2; i <= c; i++) {
         x = lo[i]; y = hi[i]
         for (j = i - 1; j >= 1 && lo[j] > x; j--) { lo[j + 1] = lo[j]; hi[j + 1] = hi[j] }
@@ -950,7 +951,12 @@ ports_cmd() {
   fi
   case "$input" in
     0|none|无) new=;;
-    *) new=$(normalize_ports "$input") && [ -n "$new" ] || fatal "端口格式不对：${input}（只能填 1-65535 的数字，或 2000-2010 这样的范围）";;
+    *)
+      if ! new=$(normalize_ports "$input" 2>/dev/null) || [ -z "$new" ]; then
+        bad=$(normalize_ports "$input" 2>&1 >/dev/null || true)
+        [ -z "$bad" ] || fatal "\"$bad\" 不是有效端口：端口只能是 1-65535 的数字，范围写成 2000-2010 这样。没有做任何修改"
+        fatal "端口格式不对：${input}（只能填 1-65535 的数字，或 2000-2010 这样的范围）"
+      fi;;
   esac
   [ ! -d /run/l2tp-vps-install.lock ] || fatal '安装/升级正在进行，请等它结束后再改'
   if [ -n "$new" ]; then

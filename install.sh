@@ -119,19 +119,20 @@ if [ -f "$STATE/password" ] && [ ! -f "$STATE/installed-version" ] && [ -t 0 ] &
 fi
 # normalize_ports：检查并整理"不走 L2TP 的端口"。和管理命令 l2tp-vps 里的同名函数完全相同（安装到这一步时
 #   管理命令还没装好，所以这里放一份副本），改动时两处一起改，测试会检查两份一致。
-#   输出每行一个端口或端口段，从小到大，重叠或相邻的段合并；有任何一项不合法就什么都不输出、返回 2。
+#   输出每行一个端口或端口段，从小到大，重叠或相邻的段合并；有任何一项不合法就什么都不输出、
+#   把这一项打印到 stderr（方便告诉用户错在哪），返回 2。
 normalize_ports() {
   printf '%s\n' "$1" | sed 's/，/ /g; s/、/ /g; s/[,;]/ /g' | awk '
     function out(a, b) { print (a == b) ? a : a "-" b }
     { for (i = 1; i <= NF; i++) {
         t = $i
-        if (t !~ /^[0-9]+(-[0-9]+)?$/) { bad = 1; exit }
+        if (t !~ /^[0-9]+(-[0-9]+)?$/) { bad = t; exit }
         n = split(t, p, "-"); a = p[1] + 0; b = (n == 2) ? p[2] + 0 : a
-        if (a < 1 || b > 65535 || a > b) { bad = 1; exit }
+        if (a < 1 || b > 65535 || a > b) { bad = t; exit }
         c++; lo[c] = a; hi[c] = b
     } }
     END {
-      if (bad) exit 2
+      if (bad != "") { print bad > "/dev/stderr"; exit 2 }
       for (i = 2; i <= c; i++) {
         x = lo[i]; y = hi[i]
         for (j = i - 1; j >= 1 && lo[j] > x; j--) { lo[j + 1] = lo[j]; hi[j + 1] = hi[j] }
@@ -176,7 +177,8 @@ BYPASS_PORTS=$(normalize_ports "$(cat "$STATE/bypass-ports" 2>/dev/null || true)
 if [ "${L2TP_BYPASS_PORTS+set}" = set ]; then
   case "$L2TP_BYPASS_PORTS" in
     0|none|无) BYPASS_PORTS=;;
-    *) BYPASS_PORTS=$(normalize_ports "$L2TP_BYPASS_PORTS") || fatal "L2TP_BYPASS_PORTS 格式不对：$L2TP_BYPASS_PORTS";;
+    *) BYPASS_PORTS=$(normalize_ports "$L2TP_BYPASS_PORTS" 2>/dev/null) ||
+         fatal "L2TP_BYPASS_PORTS 格式不对：\"$(normalize_ports "$L2TP_BYPASS_PORTS" 2>&1 >/dev/null || true)\" 不是有效端口（只能是 1-65535，范围写成 2000-2010）";;
   esac
 elif [ -t 0 ]; then
   printf '\n可选：设置不走 L2TP 的端口。这些端口上的网站或节点，进出都用 VPS 自己的 IP，完全不受 L2TP 影响。\n'
@@ -193,8 +195,14 @@ elif [ -t 0 ]; then
       '') break;;
       0|none|无) BYPASS_PORTS=; break;;
     esac
-    if new_ports=$(normalize_ports "$answer") && [ -n "$new_ports" ]; then BYPASS_PORTS=$new_ports; break; fi
-    printf '格式不对：只能填 1-65535 的数字，或 2000-2010 这样的范围。请重新输入。\n'
+    if new_ports=$(normalize_ports "$answer" 2>/dev/null) && [ -n "$new_ports" ]; then BYPASS_PORTS=$new_ports; break; fi
+    # 指出具体是哪一项不对（比如多打了一位数字的 510892），不然一长串端口里很难看出错在哪。
+    bad=$(normalize_ports "$answer" 2>&1 >/dev/null || true)
+    if [ -n "$bad" ]; then
+      printf '"%s" 不是有效端口：端口只能是 1-65535 的数字，范围写成 2000-2010 这样。请改掉这一项后重新输入。\n' "$bad"
+    else
+      printf '格式不对：只能填 1-65535 的数字，或 2000-2010 这样的范围。请重新输入。\n'
+    fi
   done
 fi
 # 检查输入：服务器只允许域名或 IPv4 的字符（字母、数字、点、减号），防止把奇怪内容写进配置。
@@ -458,21 +466,22 @@ EOF
 # 节点程序也可以自己给某个出站设置 mark 149122（即 0x24682，xray 的 sockopt.mark、sing-box 的 routing_mark），
 # 这个出站同样走原生网络；设置 mark 需要 root 权限，普通程序做不到。没有设置排除端口时，以上全部不生效。
 #
-# normalize_ports：检查并整理用户输入的端口。支持空格、逗号分隔，支持 2000-2010 这样的范围。
-#   输出每行一个端口或端口段，按从小到大排好，重叠或相邻的段会合并。有任何一项不合法就什么都不输出、返回 2。
+# normalize_ports：检查并整理用户输入的端口。支持空格、逗号、顿号分隔，支持 2000-2010 这样的范围。
+#   输出每行一个端口或端口段，按从小到大排好，重叠或相邻的段会合并。有任何一项不合法就什么都不输出、
+#   把这一项打印到 stderr（方便告诉用户错在哪），返回 2。
 #   安装器里有一份完全相同的副本（安装时管理命令还没装好），改动时两处一起改，测试会检查两份一致。
 normalize_ports() {
   printf '%s\n' "$1" | sed 's/，/ /g; s/、/ /g; s/[,;]/ /g' | awk '
     function out(a, b) { print (a == b) ? a : a "-" b }
     { for (i = 1; i <= NF; i++) {
         t = $i
-        if (t !~ /^[0-9]+(-[0-9]+)?$/) { bad = 1; exit }
+        if (t !~ /^[0-9]+(-[0-9]+)?$/) { bad = t; exit }
         n = split(t, p, "-"); a = p[1] + 0; b = (n == 2) ? p[2] + 0 : a
-        if (a < 1 || b > 65535 || a > b) { bad = 1; exit }
+        if (a < 1 || b > 65535 || a > b) { bad = t; exit }
         c++; lo[c] = a; hi[c] = b
     } }
     END {
-      if (bad) exit 2
+      if (bad != "") { print bad > "/dev/stderr"; exit 2 }
       for (i = 2; i <= c; i++) {
         x = lo[i]; y = hi[i]
         for (j = i - 1; j >= 1 && lo[j] > x; j--) { lo[j + 1] = lo[j]; hi[j + 1] = hi[j] }
@@ -1280,7 +1289,12 @@ ports_cmd() {
   fi
   case "$input" in
     0|none|无) new=;;
-    *) new=$(normalize_ports "$input") && [ -n "$new" ] || fatal "端口格式不对：${input}（只能填 1-65535 的数字，或 2000-2010 这样的范围）";;
+    *)
+      if ! new=$(normalize_ports "$input" 2>/dev/null) || [ -z "$new" ]; then
+        bad=$(normalize_ports "$input" 2>&1 >/dev/null || true)
+        [ -z "$bad" ] || fatal "\"$bad\" 不是有效端口：端口只能是 1-65535 的数字，范围写成 2000-2010 这样。没有做任何修改"
+        fatal "端口格式不对：${input}（只能填 1-65535 的数字，或 2000-2010 这样的范围）"
+      fi;;
   esac
   [ ! -d /run/l2tp-vps-install.lock ] || fatal '安装/升级正在进行，请等它结束后再改'
   if [ -n "$new" ]; then
