@@ -34,10 +34,17 @@ elif cmd=='nslookup':
 elif cmd=='timeout': sys.exit(subprocess.call(args[1:]))
 elif cmd=='su': sys.exit(subprocess.call(['/bin/sh','-c',args[args.index('-c')+1]]))
 elif cmd=='nft':
- if 'list' in args: sys.exit(0 if s.get('guard') else 1)
+ if 'list' in args:
+  if s.get('guard') and 'chain' in args: print(s.get('rules',''))
+  sys.exit(0 if s.get('guard') else 1)
  elif 'delete' in args: s['guard']=False;save()
  else:
-  rules=sys.stdin.read(); s['guard']=True; s['rules']=rules;save()
+  rules=sys.stdin.read()
+  # Program-level bypass batches only touch one chain; they never install the guard.
+  if rules.startswith('flush chain'): s['cg']=rules
+  else: s['guard']=True; s['rules']=rules
+  save()
+elif cmd=='ss': pass
 elif cmd=='ip':
  if 'rule' in args:
   if 'show' in args:
@@ -50,6 +57,7 @@ elif cmd=='ip':
    if match in s.get('rules_ip',[]): s['rules_ip'].remove(match);save()
  elif 'route' in args:
   if 'show default table main' in a: print('default via 192.0.2.1 dev eth0')
+  elif 'get' in args and 'mark' in args: print('1.1.1.1 via 192.0.2.1 dev eth0 mark 0x24682')
   elif 'get' in args:
    if s.get('connected') and s.get('ppp_route'):
     src='192.0.2.10' if s.get('bad_src') else '198.51.100.10'
@@ -88,7 +96,7 @@ class LifecycleTests(unittest.TestCase):
   self.d=Path(self.temp.name);self.bin=self.d/'bin';self.bin.mkdir()
   (self.d/'model.json').write_text('{}');(self.d/'calls.log').write_text('')
   self.mock=self.bin/'mock';self.mock.write_text(MOCK);self.mock.chmod(0o755)
-  for cmd in ['uname','id','useradd','adduser','getent','nslookup','timeout','su','nft','ip','systemctl','curl','mv','chmod','chown','sleep','modprobe','sysctl','pppd','xl2tpd','apt-get','apk','rc-service','rc-update']:
+  for cmd in ['uname','id','useradd','adduser','getent','nslookup','timeout','su','nft','ip','systemctl','curl','mv','chmod','chown','sleep','modprobe','sysctl','pppd','xl2tpd','apt-get','apk','rc-service','rc-update','ss']:
    (self.bin/cmd).symlink_to(self.mock)
   for name in ['etc','run/systemd/system','usr/local/bin','usr/local/sbin','etc/ppp','etc/xl2tpd','etc/systemd/system','etc/init.d']:(self.d/name).mkdir(parents=True,exist_ok=True)
   (self.d/'etc/debian_version').write_text('12')
@@ -113,8 +121,52 @@ class LifecycleTests(unittest.TestCase):
   if okay:self.assertEqual(r.returncode,0,r.stderr+r.stdout)
   else:self.assertNotEqual(r.returncode,0)
   return r
- def runtime(self,op):
-  return subprocess.run(['/bin/sh',str(self.d/'usr/local/sbin/l2tp-vps'),op],env=self.env,text=True,errors='replace',capture_output=True)
+ def runtime(self,op,*args):
+  return subprocess.run(['/bin/sh',str(self.d/'usr/local/sbin/l2tp-vps'),op,*args],env=self.env,text=True,errors='replace',capture_output=True,stdin=subprocess.DEVNULL)
+ def test_excluded_ports_survive_upgrade_and_can_be_changed_later(self):
+  env=self.env.copy()
+  env.update(L2TP_SERVER='l2tp.example.net',L2TP_USER='u',L2TP_PASS='p',L2TP_BYPASS_PORTS='1112, 2000-2010')
+  r=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True)
+  self.assertEqual(r.returncode,0,r.stderr+r.stdout)
+  state=self.d/'etc/l2tp-vless'
+  self.assertEqual((state/'bypass-ports').read_text(),'1112\n2000-2010\n')
+  rules=self.model()['rules']
+  self.assertIn('elements = { 1112, 2000-2010 }',rules)
+  self.assertIn('dport @bypass_ports ct mark set 0x24682',rules)
+  self.assertIn('-4 rule add pref 8906 fwmark 0x24682 table main',' | '.join(self.model()['rules_ip']))
+  self.assertIn('不走 L2TP 的端口：1112 2000-2010',r.stdout)
+  # The tunnel acceptance checks still ran and passed with exclusions active.
+  self.assertIn('安装/升级成功',r.stdout)
+  # Re-running without a terminal keeps the ports; the backup holds them too.
+  self.install(first=False)
+  self.assertEqual((state/'bypass-ports').read_text(),'1112\n2000-2010\n')
+  self.assertTrue(any((b/'bypass-ports').exists() for b in (state/'backups').iterdir()))
+  # Invalid input is rejected without touching the saved list.
+  bad=dict(self.env,L2TP_BYPASS_PORTS='70000')
+  r=subprocess.run(['/bin/sh',str(self.installer)],env=bad,text=True,errors='replace',capture_output=True)
+  self.assertNotEqual(r.returncode,0)
+  self.assertEqual((state/'bypass-ports').read_text(),'1112\n2000-2010\n')
+  # Changed later through the management command, without reinstalling.
+  r=self.runtime('ports','3000');self.assertEqual(r.returncode,0,r.stderr)
+  self.assertIn('elements = { 3000 }',self.model()['rules'])
+  r=self.runtime('ports','0');self.assertEqual(r.returncode,0,r.stderr)
+  self.assertNotIn('0x24682',self.model()['rules'])
+  self.assertFalse(any('pref 8906' in x for x in self.model().get('rules_ip',[])))
+  # recover keeps the setting for the next install but removes every rule.
+  self.runtime('ports','1112')
+  r=self.runtime('recover');self.assertEqual(r.returncode,0,r.stderr)
+  self.assertFalse(self.model()['guard'])
+  self.assertFalse(any('pref 8906' in x for x in self.model().get('rules_ip',[])))
+  self.assertEqual((state/'bypass-ports').read_text(),'1112\n')
+ def test_clearing_ports_on_reinstall(self):
+  env=self.env.copy()
+  env.update(L2TP_SERVER='l2tp.example.net',L2TP_USER='u',L2TP_PASS='p',L2TP_BYPASS_PORTS='1112')
+  self.assertEqual(subprocess.run(['/bin/sh',str(self.installer)],env=env,capture_output=True).returncode,0)
+  env=dict(self.env,L2TP_BYPASS_PORTS='0')
+  r=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True)
+  self.assertEqual(r.returncode,0,r.stderr+r.stdout)
+  self.assertFalse((self.d/'etc/l2tp-vless/bypass-ports').exists())
+  self.assertNotIn('0x24682',self.model()['rules'])
  def model(self):return json.loads((self.d/'model.json').read_text())
  def test_fresh_then_upgrade_preserves_credentials_and_snapshot(self):
   first=self.install();state=self.d/'etc/l2tp-vless'
@@ -122,7 +174,7 @@ class LifecycleTests(unittest.TestCase):
   self.install(first=False)
   self.assertEqual((state/'password').read_bytes(),password)
   self.assertTrue((state/'rollback-path').exists())
-  self.assertEqual((state/'installed-version').read_text().strip(),'2.0.6')
+  self.assertEqual((state/'installed-version').read_text().strip(),'2.1.0')
   self.assertTrue(self.model()['guard'])
   self.assertEqual((self.d/'etc/resolv.conf').read_text().splitlines()[0],'nameserver 1.1.1.1')
   options=(state/'options').read_text()
