@@ -312,6 +312,12 @@ done
 if [ -f "$BACKUP/install.sh" ] && [ -f "$BACKUP/installed-version" ]; then
   printf '%s\n' "$BACKUP" > "$STATE/rollback-path"
 fi
+# 每次安装/升级都会多一份备份，里面有密码。只留最近 10 份，再加上 rollback 要用的那一份，更早的删掉，
+# 免得旧密码一直堆在硬盘上。只删本脚本自己起名的目录（时间-进程号），别的东西不碰。
+keep=$(cat "$STATE/rollback-path" 2>/dev/null || true)
+ls -1 "$STATE/backups" | { grep -E '^[0-9]{8}T[0-9]{6}Z-[0-9]+$' || true; } | sort -r | awk 'NR > 10' | while IFS= read -r old; do
+  [ "$STATE/backups/$old" = "$keep" ] || [ "$STATE/backups/$old" = "$BACKUP" ] || rm -rf "${STATE:?}/backups/$old"
+done
 if [ "$LEGACY" = 1 ]; then
   for f in /etc/xl2tpd/xl2tpd.conf /etc/ppp/chap-secrets /etc/ppp/options.l2tp-vless; do
     [ ! -f "$f" ] || cp -p "$f" "$BACKUP/$(basename "$f").legacy"

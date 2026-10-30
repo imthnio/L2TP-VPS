@@ -266,6 +266,23 @@ class LifecycleTests(unittest.TestCase):
  def patch_model(self,**kwargs):
   model=self.model(); model.update(kwargs)
   (self.d/'model.json').write_text(json.dumps(model))
+ def test_old_backups_are_pruned_but_rollback_snapshot_is_kept(self):
+  self.install()
+  backups=self.d/'etc/l2tp-vless/backups'
+  for i in range(14):
+   (backups/('20200101T0000%02dZ-1' % i)).mkdir()
+  (backups/'20190101T000000Z-1').mkdir()
+  (backups/'keep-me').mkdir()
+  state=self.d/'etc/l2tp-vless'
+  (state/'rollback-path').write_text(str(backups/'20190101T000000Z-1')+'\n')
+  # Without installed-version the new snapshot is not a rollback target, so the old target must survive.
+  (state/'installed-version').unlink()
+  self.install(first=False)
+  names={x.name for x in backups.iterdir()}
+  self.assertIn('keep-me',names)
+  self.assertIn('20190101T000000Z-1',names)
+  self.assertEqual(len(names),12)
+  self.assertNotIn('20200101T000000Z-1',names)
  def test_install_finishes_when_the_terminal_is_gone(self):
   # After an SSH drop every write to the terminal fails; /dev/full fails writes the same way.
   env=self.env.copy()
