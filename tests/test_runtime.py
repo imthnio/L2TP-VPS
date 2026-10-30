@@ -383,6 +383,8 @@ class BypassTests(unittest.TestCase):
         log = (self.d/'ipt.log').read_text()
         self.assertIn('-t mangle -A L2TP_VPS_BYPASS -m conntrack --ctdir ORIGINAL -m cgroup --path system.slice/xray.service -j CONNMARK --set-mark 0x24682', log)
         self.assertIn('-m connmark --mark 0x24682 -j MARK --set-mark 0x24682', log)
+        # Marks a program set itself (e.g. WireGuard's 51888) are left alone, before any cgroup rule.
+        self.assertLess(log.index('-A L2TP_VPS_BYPASS -m mark ! --mark 0 -j RETURN'), log.index('-m cgroup'))
         self.assertIn('IP6T', log)
         status = (self.d/'run/l2tp-vps-bypass.status').read_text()
         self.assertNotIn('fail|', status)
@@ -420,6 +422,9 @@ class BypassTests(unittest.TestCase):
         self.assertIn('iifname != { "lo", "l2tp-aa" } ct state new fib daddr type local tcp dport @bypass_ports ct mark set 0x24682', out)
         self.assertIn('iifname != { "lo", "l2tp-aa" } ct state new fib daddr type local udp dport @bypass_ports ct mark set 0x24682', out)
         self.assertIn('tcp sport @bypass_ports ct mark set 0x24682 meta mark set 0x24682 accept', out)
+        # A program's own mark wins over sport and service rules.
+        self.assertLess(out.index('meta mark != 0 accept'), out.index('tcp sport @bypass_ports'))
+        self.assertLess(out.index('meta mark != 0 accept'), out.index('jump l2tp_bypass_cg'))
         self.assertIn('jump l2tp_bypass_cg', out)
         self.assertIn('oifname "eth0" meta mark 0x24682 ip saddr != { 192.0.2.10, 192.0.2.11 } masquerade', out)
         self.assertIn('oifname "eth0" meta mark 0x24682 ip6 saddr != { 2001:db8::10 } masquerade', out)

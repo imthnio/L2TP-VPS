@@ -581,10 +581,13 @@ bypass_rules() {
     iifname != { \"lo\", \"$PEER\" } ct state new fib daddr type local tcp dport @bypass_ports ct mark set $BYPASS
     iifname != { \"lo\", \"$PEER\" } ct state new fib daddr type local udp dport @bypass_ports ct mark set $BYPASS
     ct mark $BYPASS meta mark set $BYPASS"
-  # 本机发出的包：回包照旧交给 l2tp_route；已经判定为排除的连接继续打标记；
+  # 本机发出的包：回包照旧交给 l2tp_route；程序自己已经设了标记的包原样放过；已经判定为排除的连接继续打标记；
   #   第 2 层按源端口、第 3 层按程序（l2tp_bypass_cg 链由 bypass_refresh 动态填写）。
+  #   程序自己设的标记要保留：比如 WireGuard 落地脚本让节点的某些出站带 51888 进 WireGuard，
+  #   节点又刚好在排除端口上被按程序排除时，覆盖成 BYPASS 会让这些流量改走 VPS 原生 IP、不去落地机。
   bypass_out="
     ct direction reply accept
+    meta mark != 0 accept
     ct mark $BYPASS meta mark set $BYPASS accept"
   if reserve_ok; then
     bypass_out="$bypass_out
@@ -725,6 +728,8 @@ ipt_bypass() {
       [ "$tool" != iptables ] || printf '%s\n' "$@"
       continue
     fi
+    # 程序自己已经设了标记的包不动（和 nftables 方式一样，见 bypass_rules）。
+    "$tool" -w -t mangle -A L2TP_VPS_BYPASS -m mark ! --mark 0 -j RETURN 2>/dev/null || true
     for path in "$@"; do
       "$tool" -w -t mangle -A L2TP_VPS_BYPASS -m conntrack --ctdir ORIGINAL -m cgroup --path "${path#/}" -j CONNMARK --set-mark "$BYPASS" 2>/dev/null ||
         { [ "$tool" = iptables ] && printf '%s\n' "$path"; }
