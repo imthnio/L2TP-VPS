@@ -84,6 +84,7 @@ ip() {
     '-4 rule show pref 8900') printf '%s\\n' '8900: from all uidrange 987-987 lookup main';;
     '-4 rule show pref 8904') printf '%s\\n' '8904: from all fwmark 0x24681 lookup 24680';;
     '-4 rule show pref 8905') printf '%s\\n' '8905: from all fwmark 0x24680 lookup main';;
+    '-4 rule show pref 8906') printf '%s\\n' '8906: from all fwmark 0x24682 lookup main';;
     '-4 rule show pref 8915') printf '%s\\n' '8915: from all lookup main suppress_prefixlength 0';;
     '-4 rule show pref 8920') printf '%s\\n' '8920: from all lookup 24680';;
     '-4 rule show pref 8930') printf '%s\\n' '8930: from all blackhole';;
@@ -705,13 +706,16 @@ class BypassTests(unittest.TestCase):
         out = self.run_sh('ports_cmd 1112 </dev/null', setup).stdout
         self.assertNotIn('GUARD', out)
 
-    def test_policy_check_notices_missing_bypass_rule(self):
-        (self.d/'bypass-ports').write_text('1112\n')
-        out = self.run_sh('policy_missing && echo MISSING || echo OK', POLICY_PRESENT).stdout
-        self.assertIn('MISSING', out)
-        (self.d/'bypass-ports').unlink()
+    def test_policy_check_notices_missing_mark_rule(self):
         out = self.run_sh('policy_missing && echo MISSING || echo OK', POLICY_PRESENT).stdout
         self.assertIn('OK', out)
+        # 8906 is needed with or without excluded ports: WireGuard's fwmark relies on it.
+        without = POLICY_PRESENT.replace("'8906: from all fwmark 0x24682 lookup main'", "''")
+        for ports in ['1112\n', None]:
+            if ports: (self.d/'bypass-ports').write_text(ports)
+            elif (self.d/'bypass-ports').exists(): (self.d/'bypass-ports').unlink()
+            out = self.run_sh('policy_missing && echo MISSING || echo OK', without).stdout
+            self.assertIn('MISSING', out)
 
 BASE = '''NATIVE_IF=eth0
 NATIVE_IP=192.0.2.10
@@ -735,6 +739,7 @@ ip() {
     '-4 rule show pref 8900') printf '%s\\n' '8900: from all uidrange 987-987 lookup main';;
     '-4 rule show pref 8904') printf '%s\\n' '8904: from all fwmark 0x24681 lookup 24680';;
     '-4 rule show pref 8905') printf '%s\\n' '8905: from all fwmark 0x24680 lookup main';;
+    '-4 rule show pref 8906') printf '%s\\n' '8906: from all fwmark 0x24682 lookup main';;
     '-4 rule show pref 8915') printf '%s\\n' '8915: from all lookup main suppress_prefixlength 0';;
     '-4 rule show pref 8920') printf '%s\\n' '8920: from all lookup 24680';;
     '-4 rule show pref 8930') printf '%s\\n' '8930: from all blackhole';;
