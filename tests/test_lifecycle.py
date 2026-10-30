@@ -283,6 +283,17 @@ class LifecycleTests(unittest.TestCase):
   self.assertIn('20190101T000000Z-1',names)
   self.assertEqual(len(names),12)
   self.assertNotIn('20200101T000000Z-1',names)
+ def test_dns_changed_after_recover_is_what_the_next_recover_restores(self):
+  self.install()
+  r=self.runtime('recover');self.assertEqual(r.returncode,0,r.stderr)
+  self.assertEqual((self.d/'etc/resolv.conf').read_text(),'nameserver 192.0.2.53\n')
+  (self.d/'etc/resolv.conf').write_text('nameserver 203.0.113.53\n')
+  self.install(first=False)
+  self.assertEqual((self.d/'etc/resolv.conf').read_text().splitlines()[0],'nameserver 1.1.1.1')
+  # Re-running while our DNS is active must not replace the saved copy with our own file.
+  self.install(first=False)
+  r=self.runtime('recover');self.assertEqual(r.returncode,0,r.stderr)
+  self.assertEqual((self.d/'etc/resolv.conf').read_text(),'nameserver 203.0.113.53\n')
  def test_install_finishes_when_the_terminal_is_gone(self):
   # After an SSH drop every write to the terminal fails; /dev/full fails writes the same way.
   env=self.env.copy()

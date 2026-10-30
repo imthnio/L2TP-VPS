@@ -602,9 +602,11 @@ fi
 # 把系统 DNS 换成 1.1.1.1 / 9.9.9.9，并让 DNS 查询也走隧道，防止断线后从原生网络查 DNS 泄露访问记录。
 # 原来的 /etc/resolv.conf 会先备份，recover/卸载时还原。用"先建新链接再改名"的方式替换，避免中途没有 DNS 文件。
 if [ "$(readlink /etc/resolv.conf 2>/dev/null || true)" != /etc/l2tp-vps-resolv.conf ]; then
+  # 每次真正替换前都重新备份当前的文件：recover 之后用户可能改过 DNS，再装时如果还留着最早那份备份，
+  # 下次 recover/卸载就会把用户后来的改动覆盖掉。先删旧备份再复制：旧备份若是符号链接，cp 会顺着它写到别处。
   # 少数精简系统根本没有 /etc/resolv.conf，没东西可备份就跳过（否则 cp 失败会让安装半途退出）。
-  if [ ! -e "$STATE/resolv.conf.before-v2" ] && [ ! -L "$STATE/resolv.conf.before-v2" ] &&
-     { [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; }; then
+  if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
+    rm -f "$STATE/resolv.conf.before-v2"
     cp -a /etc/resolv.conf "$STATE/resolv.conf.before-v2"
   fi
   printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\noptions timeout:2 attempts:2\n' > /etc/l2tp-vps-resolv.conf
