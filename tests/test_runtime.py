@@ -300,6 +300,28 @@ printf 'lns = 198.51.100.1\\n' > "$STATE/xl2tpd.conf"
         self.assertIn('FILE:ENDPOINT=203.0.113.9', out)
         self.assertIn('LNS:lns = 203.0.113.9', out)
 
+    def test_watch_reloads_endpoint_after_refresh_subshell(self):
+        self.assertIn('(load; refresh; load; restore_policy; endpoint_route; ensure_peer_route)', RUNTIME)
+
+    def test_peer_up_is_ignored_when_disabled(self):
+        (self.d/'disabled').write_text('')
+        self.assertEqual(self.run_sh('peer_up l2tp-aa tty 0 1 2 l2tp-vps; peer_v6 l2tp-aa tty 0 1 2 l2tp-vps'), '')
+
+    def test_rollback_restores_snapshot_bypass_ports(self):
+        snap = self.d / 'backups/20260101T000000Z-1'
+        snap.mkdir(parents=True)
+        (snap/'server').write_text('s.example.net\n')
+        (snap/'user').write_text('u\n')
+        (snap/'password').write_text('p\n')
+        (snap/'bypass-ports').write_text('1112\n2000-2010\n')
+        (snap/'install.sh').write_text('printf "%s|%s|%s|%s\\n" "$L2TP_SERVER" "$L2TP_USER" "$L2TP_PASS" "$L2TP_BYPASS_PORTS"\n')
+        (self.d/'rollback-path').write_text(str(snap)+'\n')
+        out = self.run_sh('rollback')
+        self.assertEqual(out.strip(), 's.example.net|u|p|1112 2000-2010')
+        (snap/'bypass-ports').unlink()
+        out = self.run_sh('rollback')
+        self.assertEqual(out.strip(), 's.example.net|u|p|0')
+
 class BypassTests(unittest.TestCase):
     """Excluded ports: parsing, firewall rendering, reserved ports and program detection."""
     def setUp(self):
@@ -383,7 +405,8 @@ class BypassTests(unittest.TestCase):
         log = (self.d/'ipt.log').read_text()
         self.assertIn('-t mangle -A L2TP_VPS_BYPASS -m conntrack --ctdir ORIGINAL -m cgroup --path system.slice/xray.service -j CONNMARK --set-mark 0x24682', log)
         self.assertIn('-m connmark --mark 0x24682 -j MARK --set-mark 0x24682', log)
-        # Marks a program set itself (e.g. WireGuard's 51888) are left alone, before any cgroup rule.
+        # Loopback hops and marks a program set itself (e.g. WireGuard's 51888) are left alone, before any cgroup rule.
+        self.assertLess(log.index('-A L2TP_VPS_BYPASS -o lo -j RETURN'), log.index('-m cgroup'))
         self.assertLess(log.index('-A L2TP_VPS_BYPASS -m mark ! --mark 0 -j RETURN'), log.index('-m cgroup'))
         self.assertIn('IP6T', log)
         status = (self.d/'run/l2tp-vps-bypass.status').read_text()
@@ -462,12 +485,16 @@ class BypassTests(unittest.TestCase):
         self.assertEqual((self.d/'bypass-reserved').read_text().strip(), '')
 
     def test_reserve_refuses_to_starve_ephemeral_ports(self):
-        (self.d/'bypass-ports').write_text('20000-60000\n')
-        self.reserved('')
+        (self.d/'bypass-ports').write_text('1112\n')
+        self.reserved('8080')
+        self.run_sh('bypass_reserve')
+        self.assertEqual((self.d/'proc/sys/net/ipv4/ip_local_reserved_ports').read_text().strip(), '8080,1112')
+        (self.d/'bypass-ports').write_text('1112\n20000-60000\n')
         r = self.run_sh('bypass_reserve && echo OK || echo REFUSED; reserve_ok && echo RES || echo NORES')
         self.assertIn('REFUSED', r.stdout)
         self.assertIn('NORES', r.stdout)
-        self.assertEqual((self.d/'proc/sys/net/ipv4/ip_local_reserved_ports').read_text().strip(), '')
+        self.assertEqual((self.d/'proc/sys/net/ipv4/ip_local_reserved_ports').read_text().strip(), '8080')
+        self.assertEqual((self.d/'bypass-reserved').read_text().strip(), '')
         self.assertNotIn('sport @bypass_ports', self.run_sh('render_firewall').stdout)
 
     def test_guard_always_adds_the_mark_route_rule(self):
@@ -685,9 +712,12 @@ class BypassTests(unittest.TestCase):
         self.run_sh('bypass_refresh', setup)
         status = (self.d/'run/l2tp-vps-bypass.status').read_text()
         self.assertIn('fail|/system.slice/xray.service', status)
+        self.assertNotIn('ok|/system.slice/xray.service', status)
         shown = self.run_sh('bypass_show').stdout
         self.assertIn('xray.service', shown)
         self.assertIn('没装上', shown)
+        self.assertNotIn('全部出站都走 VPS 原生 IP', shown)
+        self.assertNotIn('现在没有程序在监听', shown)
 
     def test_ports_command_validates_and_applies(self):
         setup = (

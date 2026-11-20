@@ -40,7 +40,7 @@ BACKUP=
 # SSH 断开后终端已关闭，再往屏幕打印会出错；在 set -e 下这会让安装半途退出，上面忽略 HUP 就白做了。
 # 所以打印失败一律忽略，安装照常做完。
 fatal() { printf '[出错] %s\n' "$*" >&2 2>/dev/null || true; exit 1; }
-info() { printf '[L2TP-VPS] %s\n' "$*" 2>/dev/null || true; }
+info() { (printf '[L2TP-VPS] %s\n' "$*") 2>/dev/null || true; }
 # ---------- 第 1 步：检查运行环境 ----------
 # 只支持 Linux；必须是 root；Debian/Ubuntu 需要正在运行的 systemd，Alpine 需要 OpenRC。
 [ "$(uname -s)" = Linux ] || fatal '只支持 Linux VPS'
@@ -82,11 +82,11 @@ value() { sed -n "s/^$2=//p" "$1" | head -1; }
 if [ -f "$STATE/net.env" ] && [ ! -f "$STATE/v2-owned" ]; then LEGACY=1; fi
 [ ! -f "$STATE/legacy-pending" ] || LEGACY=1
 old_server=; old_user=; old_pass=
-if [ -f "$STATE/password" ]; then
+if [ -f "$STATE/password" ] || [ -f "$STATE/server" ] || [ -f "$STATE/user" ]; then
   # 某个文件缺了（比如上次恰好写到一半）就当作没保存，稍后重新询问，而不是直接报错退出。
   old_server=$(cat "$STATE/server" 2>/dev/null || true)
   old_user=$(cat "$STATE/user" 2>/dev/null || true)
-  old_pass=$(cat "$STATE/password")
+  old_pass=$(cat "$STATE/password" 2>/dev/null || true)
 elif [ "$LEGACY" = 1 ]; then
   old_server=$(value "$STATE/net.env" SERVER_IP)
   old_user=$(awk '$1=="name" {print $2; exit}' /etc/ppp/options.l2tp-vless 2>/dev/null || true)
@@ -322,6 +322,9 @@ done
 if [ -f "$BACKUP/install.sh" ] && [ -f "$BACKUP/installed-version" ]; then
   printf '%s\n' "$BACKUP" > "$STATE/rollback-path"
 fi
+# 备份完成后先拿掉"已安装完成"标记，全部验收通过后再写回：
+# 若本次升级中途失败，status 不会误报成功，下次重跑也能询问是否重填账号，且不会用半成品冲掉回滚快照。
+rm -f "$STATE/installed-version"
 # 每次安装/升级都会多一份备份，里面有密码。只留最近 10 份，再加上 rollback 要用的那一份，更早的删掉，
 # 免得旧密码一直堆在硬盘上。只删本脚本自己起名的目录（时间-进程号），别的东西不碰。
 keep=$(cat "$STATE/rollback-path" 2>/dev/null || true)
@@ -563,7 +566,10 @@ bypass_reserve() {
   # 都分不到端口、连不了网，反而把 L2TP 弄坏。所以保留后剩下的临时端口不足 8192 个时就不保留，
   # 改为不按源端口排除（连进排除端口的连接仍然不走 L2TP）。
   range=$(cat /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || echo '32768 60999')
-  if [ -n "$added" ] && [ "$(portset free "$current" "$added" "$range")" -lt 8192 ]; then return 1; fi
+  if [ -n "$added" ] && [ "$(portset free "$current" "$added" "$range")" -lt 8192 ]; then
+    [ "${1:-}" = release ] || bypass_reserve release >/dev/null 2>&1 || true
+    return 1
+  fi
   if [ -n "$added" ]; then
     { printf '%s\n' "${current:+$current,}$added" > "$RESERVED"; } 2>/dev/null || return 1
     owned=$(portset minus "${owned:+$owned,}$added" '')
@@ -677,7 +683,7 @@ bypass_scan() {
       # 只在本机内部监听（127.0.0.1、::1）的端口，外面连不进来，不可能是对外的节点，比如 xray 的 API、
       # sing-box 的 clash_api、3x-ui 内部用的端口。几乎每个节点程序都有一个，不能因为它就拒绝按程序排除。
       addr = $5; sub(/:[^:]*$/, "", addr)
-      loop = (addr ~ /^127\./ || addr ~ /^\[::1\]/ || addr ~ /^\[::ffff:127\./ || addr ~ /%lo$/)
+      loop = (addr ~ /^127\./ || addr == "::1" || addr ~ /^\[::1\]/ || addr ~ /^\[?::ffff:127\./ || addr ~ /%lo$/)
       while (match(rest, /pid=[0-9]+/)) {
         pid = substr(rest, RSTART + 4, RLENGTH - 4); rest = substr(rest, RSTART + RLENGTH)
         path = cgroup(pid); if (path == "") continue
@@ -732,7 +738,8 @@ ipt_bypass() {
       [ "$tool" != iptables ] || printf '%s\n' "$@"
       continue
     fi
-    # 程序自己已经设了标记的包不动（和 nftables 方式一样，见 bypass_rules）。
+    # 发往本机回环的包、以及程序自己已经设了标记的包不动（和 nftables 方式一样，见 bypass_rules）。
+    "$tool" -w -t mangle -A L2TP_VPS_BYPASS -o lo -j RETURN 2>/dev/null || true
     "$tool" -w -t mangle -A L2TP_VPS_BYPASS -m mark ! --mark 0 -j RETURN 2>/dev/null || true
     for path in "$@"; do
       "$tool" -w -t mangle -A L2TP_VPS_BYPASS -m conntrack --ctdir ORIGINAL -m cgroup --path "${path#/}" -j CONNMARK --set-mark "$BYPASS" 2>/dev/null ||
@@ -798,8 +805,9 @@ EOF
   # shellcheck disable=SC2086
   still=$(ipt_bypass $failed)
   {
-    printf '%s\n' "$scan"
-    for path in $still; do printf 'fail|%s\n' "$path"; done
+    printf '%s\n' "$scan" | awk -F'|' -v s=" $(printf '%s' "$still" | tr '\n' ' ') " '
+      $1 == "ok" && index(s, " " $2 " ") { print "fail|" $2 "|" $3; next }
+      { print }'
     reserve_ok || echo 'noreserve||'
   } > /run/l2tp-vps-bypass.status
   printf '%s\n' "$sig" > /run/l2tp-vps-bypass.sig
@@ -973,7 +981,7 @@ peer_up() {
   # peer_up：pppd 拨通时由 /etc/ppp/ip-up.d/10-l2tp-vps 调用。参数：$1 网卡名 … $6 ipparam。
   # 网卡名是 l2tp-aa 且 ipparam 是 l2tp-vps 才处理，机器上别的 PPP 连接（如 ppp0）不会被误用。
   # 做的事：在隧道表加默认路由 dev l2tp-aa metric 100，从此新连接都走隧道。
-  [ "${1:-}" = "$PEER" ] && [ "${6:-}" = "$TAG" ] || return 0
+  [ "${1:-}" = "$PEER" ] && [ "${6:-}" = "$TAG" ] && [ ! -f "$STATE/disabled" ] || return 0
   ip -4 route replace default dev "$PEER" metric 100 table "$TABLE"
   sysctl -w "net.ipv4.conf.$PEER.rp_filter=0" >/dev/null || true
   sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null || true
@@ -982,7 +990,7 @@ peer_up() {
 }
 # peer_v6：隧道网卡拿到了全局 IPv6 地址，才让 IPv6 也走隧道；否则 IPv6 保持被挡住。
 peer_v6() {
-  [ "${1:-}" = "$PEER" ] && [ "${6:-}" = "$TAG" ] || return 0
+  [ "${1:-}" = "$PEER" ] && [ "${6:-}" = "$TAG" ] && [ ! -f "$STATE/disabled" ] || return 0
   if ip -6 addr show dev "$PEER" scope global 2>/dev/null | grep -q 'inet6'; then
     ip -6 route replace default dev "$PEER" metric 100 table "$TABLE"
   fi
@@ -1013,7 +1021,8 @@ resolve() {
   chmod 755 "$tmp"
   cat > "$tmp/worker" <<EOF
 #!/bin/sh
-timeout 15 nslookup -type=A '$SERVER' 1.1.1.1 2>/dev/null || timeout 15 nslookup -type=A '$SERVER' 9.9.9.9 2>/dev/null
+out=\$(timeout 15 nslookup -type=A '$SERVER' 1.1.1.1 2>/dev/null || true)
+printf '%s\\n' "\$out" | grep -q '^Name:' && printf '%s\\n' "\$out" || timeout 15 nslookup -type=A '$SERVER' 9.9.9.9 2>/dev/null
 EOF
   chmod 755 "$tmp/worker"
   result=$(worker "$tmp/worker" 2>/dev/null || true)
@@ -1049,8 +1058,11 @@ fetch() (
   host=${url#https://}; host=${host%%/*}
   cat > "$tmp/worker" <<EOF
 #!/bin/sh
-answer=\$(timeout 15 nslookup -type=A '$host' 1.1.1.1 2>/dev/null || timeout 15 nslookup -type=A '$host' 9.9.9.9 2>/dev/null)
-addr=\$(printf '%s\\n' "\$answer" | awk '/^Name:/ {a=1} a && /^Address/ { for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+\$/) {print \$i; exit} }')
+for ns in 1.1.1.1 9.9.9.9; do
+  answer=\$(timeout 15 nslookup -type=A '$host' "\$ns" 2>/dev/null || true)
+  addr=\$(printf '%s\\n' "\$answer" | awk '/^Name:/ {a=1} a && /^Address/ { for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+\$/) {print \$i; exit} }')
+  [ -z "\$addr" ] || break
+done
 [ -n "\$addr" ] || exit 1
 exec curl --resolve '$host:443:'"\$addr" -4 --noproxy '*' --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 15 --max-time 90 --retry 2 -o '$tmp/out/payload' '$url'
 EOF
@@ -1094,6 +1106,8 @@ policy_missing() {
     ip -6 rule show pref 8900 | grep -q "uidrange $FETCH_UID-$FETCH_UID" || return 0
     ip -6 rule show pref 8904 | grep -q "fwmark $TUNMARK" || return 0
     ip -6 rule show pref 8905 | grep -q "fwmark $MARK" || return 0
+    ip -6 rule show pref 8911 | grep -q 'fe80::/10' || return 0
+    ip -6 rule show pref 8911 | grep -q 'ff02::/16' || return 0
     ip -6 rule show pref 8915 | grep -q suppress_prefixlength || return 0
     ip -6 rule show pref 8920 | grep -q "lookup $TABLE" || return 0
     ip -6 rule show pref 8930 | grep -q blackhole || return 0
@@ -1142,7 +1156,7 @@ refresh() (
 # ensure_peer_route：隧道明明在线，但隧道默认路由丢了（比如被别的程序删掉），就补回来。
 ensure_peer_route() {
   ip -4 addr show dev "$PEER" 2>/dev/null | grep -q 'inet ' || return 0
-  if ! ip -4 route show default table "$TABLE" | grep -q "dev $PEER"; then
+  if ! ip -4 route show default table "$TABLE" 2>/dev/null | grep -q "dev $PEER"; then
     peer_up "$PEER" '' '' '' '' "$TAG"
   fi
 }
@@ -1153,17 +1167,18 @@ watch() {
   rmdir /run/l2tp-vps-refresh.lock 2>/dev/null || true
   while :; do
     sleep 3
-    [ ! -f "$STATE/disabled" ] || continue
+    [ ! -f "$STATE/disabled" ] && [ ! -d /run/l2tp-vps-install.lock ] || continue
     tick=$((tick + 3))
     # 排除端口上的服务可能刚启动或重启过，每 3 秒检查一次，及时把它的出站改走原生网络。
-    if [ -s "$STATE/bypass-ports" ] && [ ! -d /run/l2tp-vps-install.lock ]; then
+    if [ -s "$STATE/bypass-ports" ] || [ -f /run/l2tp-vps-bypass.sig ]; then
       (load; bypass_refresh) >/dev/null 2>&1 || true
     fi
     # 每 3 秒看一眼防火墙表还在不在：重启 nftables 服务或执行 nft flush ruleset 会把它清掉，
     # 如果此时隧道正好断开，原生网卡就没有保护了。发现丢了立即补回；平时每 15 秒做一次完整巡检。
     if [ "$tick" -lt 15 ] && nft list table inet l2tp_vps >/dev/null 2>&1; then continue; fi
     tick=0
-    (load; refresh; restore_policy; endpoint_route; ensure_peer_route) || true
+    # refresh 在子进程里运行，若它发现域名换了 IP 并改写了 net.env，后面要重新 load 一次才能拿到新 IP。
+    (load; refresh; load; restore_policy; endpoint_route; ensure_peer_route) || true
     # 隧道的 IPv6 地址可能晚一些才分配到，每轮都检查一次。
     peer_v6 "$PEER" '' '' '' '' "$TAG" || true
   done
@@ -1303,6 +1318,8 @@ uninstall() {
 update() (
   tmp=$(mktemp -d /tmp/l2tp-update.XXXXXXXX)
   trap 'rm -rf "$tmp"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   commit=
   if fetch "https://api.github.com/repos/imthnio/L2TP-VPS/commits/main?cb=$(date +%s)" "$tmp/commit.json"; then
     commit=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$tmp/commit.json" | head -1)
@@ -1321,17 +1338,23 @@ update() (
   sh -n "$tmp/bootstrap.sh"
   sh "$tmp/bootstrap.sh"
 )
-# rollback：用上一次安装前保存的快照离线回滚（不联网下载任何东西），账号用快照里的。
+# rollback：用上一次安装前保存的快照离线回滚（不联网下载任何东西），账号和排除端口都用快照里的。
 rollback() {
   [ -f "$STATE/rollback-path" ] || fatal '没有可离线回滚的新版快照；旧版迁移失败请使用 recover'
   previous=$(cat "$STATE/rollback-path")
   case "$previous" in "$STATE"/backups/*) ;; *) fatal '无效的备份路径';; esac
   [ -f "$previous/install.sh" ] || fatal '上一版本安装器不存在'
+  [ -f "$previous/server" ] && [ -f "$previous/user" ] && [ -f "$previous/password" ] || fatal '快照缺少账号文件'
   # 快照只有 root 能写，比临时下载更可信。
   L2TP_SERVER=$(cat "$previous/server")
   L2TP_USER=$(cat "$previous/user")
   L2TP_PASS=$(cat "$previous/password")
-  export L2TP_SERVER L2TP_USER L2TP_PASS
+  if [ -f "$previous/bypass-ports" ]; then
+    L2TP_BYPASS_PORTS=$(awk 'NF {printf "%s%s", (n++ ? " " : ""), $1}' "$previous/bypass-ports")
+  else
+    L2TP_BYPASS_PORTS=0
+  fi
+  export L2TP_SERVER L2TP_USER L2TP_PASS L2TP_BYPASS_PORTS
   exec sh "$previous/install.sh"
 }
 # bypass_show：用大白话显示排除端口，以及每个端口现在是怎么生效的。
@@ -1358,7 +1381,8 @@ bypass_show() {
       print "  · 端口 " $3 "：服务 " name($2) " 只排除了端口本身的进出，它转发的出站仍走 L2TP"
       print "      原因：" $4
       print "      办法：把这个节点单独做成一个只用排除端口的服务，或在节点里给它的出站设置 mark 149122" }
-    $1 == "fail" { print "  · 服务 " name($2) "：按程序排除没装上（需要内核 5.13+ 和 nftables 1.0+，或者装了 iptables 且内核 4.5+），只排除端口本身的进出" }
+    $1 == "fail" { n = split($3, q, " "); for (i = 1; i <= n; i++) seen[q[i]] = 1
+      print "  · 端口 " $3 "：服务 " name($2) " 按程序排除没装上（需要内核 5.13+ 和 nftables 1.0+，或者装了 iptables 且内核 4.5+），只排除端口本身的进出" }
     END { n = split(ports, q, " ")
       for (i = 1; i <= n; i++) if (q[i] !~ /-/ && !(q[i] in seen)) print "  · 端口 " q[i] "：现在没有程序在监听（服务启动后 3 秒内自动识别；节点若跑在 Docker 网桥模式里，这里看不到它，它的出站仍走 L2TP，请改用 host 网络）" }' /run/l2tp-vps-bypass.status
   echo '  高级：节点程序给某个出站设置 mark 149122（0x24682），这个出站也走 VPS 原生 IP。'
@@ -1420,11 +1444,13 @@ ensure_iptables() {
 # status：显示版本、隧道地址、隧道路由表、策略规则和防火墙。
 status() {
   printf '版本：'; cat "$STATE/installed-version" 2>/dev/null || echo '未完成安装'
-  printf '隧道：'; ip -4 -o addr show dev "$PEER" 2>/dev/null || true
+  peer_addr=$(ip -4 -o addr show dev "$PEER" 2>/dev/null || true)
+  printf '隧道：%s\n' "${peer_addr:-未连接}"
   printf '出口路由：\n'; ip -4 route show table "$TABLE" 2>/dev/null || true
   printf '策略规则：\n'
   ip -4 rule show pref 8905 2>/dev/null || true
   ip -4 rule show pref 8906 2>/dev/null || true
+  ip -4 rule show pref 8907 2>/dev/null || true
   ip -4 rule show pref 8920 2>/dev/null || true
   ip -4 rule show pref 8930 2>/dev/null || true
   printf '防火墙：\n'; nft list table inet l2tp_vps 2>/dev/null || true
@@ -1471,10 +1497,13 @@ case "$SERVER" in
       function valid(x, a,n,i) { n=split(x,a,"."); if(n!=4)return 0; for(i=1;i<=4;i++)if(a[i]!~/^[0-9]+$/||a[i]>255)return 0; return 1 }
       valid($1) { print $1; exit }' || true)
     if [ -z "$resolved" ]; then
-      resolved=$({ timeout 15 nslookup -type=A "$SERVER" 1.1.1.1 || timeout 15 nslookup -type=A "$SERVER" 9.9.9.9; } 2>/dev/null | awk '
-        function valid(x, a,n,i) { n=split(x,a,"."); if(n!=4)return 0; for(i=1;i<=4;i++)if(a[i]!~/^[0-9]+$/||a[i]>255)return 0; return 1 }
-        /^Name:/ { answer=1 }
-        answer && /^Address/ { for (i=1; i<=NF; i++) if (valid($i)) { print $i; exit } }' || true)
+      for ns in 1.1.1.1 9.9.9.9; do
+        resolved=$(timeout 15 nslookup -type=A "$SERVER" "$ns" 2>/dev/null | awk '
+          function valid(x, a,n,i) { n=split(x,a,"."); if(n!=4)return 0; for(i=1;i<=4;i++)if(a[i]!~/^[0-9]+$/||a[i]>255)return 0; return 1 }
+          /^Name:/ { answer=1 }
+          answer && /^Address/ { for (i=1; i<=NF; i++) if (valid($i)) { print $i; exit } }' || true)
+        [ -z "$resolved" ] || break
+      done
     fi
     [ -z "$resolved" ] || ENDPOINT=$resolved;;
   *) ENDPOINT=$SERVER;;
@@ -1658,6 +1687,7 @@ supervisor="supervise-daemon"
 respawn_delay=10
 pidfile="/run/l2tp-vps-watch.pid"
 depend() { need l2tp-vps; }
+start_pre() { [ ! -f /etc/l2tp-vless/disabled ]; }
 EOF
   chmod 755 /etc/init.d/l2tp-vps /etc/init.d/l2tp-vps-guard /etc/init.d/l2tp-vps-watch
 fi
@@ -1798,6 +1828,11 @@ from_native=$(ip -4 route get 1.1.1.1 from "$NATIVE_IP" 2>/dev/null || true)
 printf '%s\n' "$from_native" | grep -q "dev $PEER" || fatal '绑定 VPS 原地址的连接没有走 L2TP；节点出口会仍是 VPS'
 bound=$(curl -4 --noproxy '*' --interface "$NATIVE_IP" -fsS --connect-timeout 10 --max-time 20 https://api.ipify.org || curl -4 --noproxy '*' --interface "$NATIVE_IP" -fsS --connect-timeout 10 --max-time 20 https://ifconfig.me || true)
 bound=$(printf '%s' "$bound" | tr -d '[:space:]')
+if ! printf '%s\n' "$bound" | awk -F. 'NF!=4{exit 1}{for(i=1;i<=4;i++)if($i!~/^[0-9]+$/||$i>255)exit 1}'; then
+  trace=$(curl -4 --noproxy '*' --interface "$NATIVE_IP" -kfsS --connect-timeout 10 --max-time 20 https://1.1.1.1/cdn-cgi/trace || true)
+  bound=$(printf '%s\n' "$trace" | awk -F= '$1=="ip" {print $2; exit}')
+  bound=$(printf '%s' "$bound" | tr -d '[:space:]')
+fi
 printf '%s\n' "$bound" | awk -F. 'NF!=4{exit 1}{for(i=1;i<=4;i++)if($i!~/^[0-9]+$/||$i>255)exit 1}' || fatal '绑定 VPS 原地址后无法经隧道访问外网'
 [ "$bound" != "$NATIVE_IP" ] || fatal '绑定 VPS 原地址的连接出口仍是 VPS'
 # 4. 如果 VPS 有原生 IPv6，确认 IPv6 不会从原生地址出去。
@@ -1818,7 +1853,7 @@ if [ -n "$BYPASS_PORTS" ]; then
 fi
 # 全部通过：记下版本号，保存这份安装器（以后 rollback 用），打印结果。SUCCESS=1 让 finish 不再报失败。
 printf '%s\n' "$VERSION" > "$STATE/installed-version"
-if [ -f "$0" ]; then cp "$0" "$STATE/install.sh"; chmod 600 "$STATE/install.sh"; fi
+if [ -f "$0" ]; then cp "$0" "$STATE/install.sh.new" && chmod 600 "$STATE/install.sh.new" && mv "$STATE/install.sh.new" "$STATE/install.sh"; fi
 info "安装/升级成功：${VERSION}；公网出口 ${out}，不是 VPS 原生地址"
 info "本机新连接和节点出站都走 L2TP。SSH 与节点端口仍使用 VPS 原地址 ${NATIVE_IP}。"
 info '以后重复运行 README 安装命令，或运行 sudo l2tp-vps update，即可升级并保留账号。'

@@ -118,7 +118,7 @@ class LifecycleTests(unittest.TestCase):
  def install(self,first=True,okay=True):
   env=self.env.copy()
   if first: env.update(L2TP_SERVER='l2tp.example.net',L2TP_USER='user@example.net',L2TP_PASS='space "quote" \\ $ end')
-  r=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True)
+  r=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True,stdin=subprocess.DEVNULL)
   if okay:self.assertEqual(r.returncode,0,r.stderr+r.stdout)
   else:self.assertNotEqual(r.returncode,0)
   return r
@@ -127,7 +127,7 @@ class LifecycleTests(unittest.TestCase):
  def test_excluded_ports_survive_upgrade_and_can_be_changed_later(self):
   env=self.env.copy()
   env.update(L2TP_SERVER='l2tp.example.net',L2TP_USER='u',L2TP_PASS='p',L2TP_BYPASS_PORTS='1112, 2000-2010')
-  r=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True)
+  r=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True,stdin=subprocess.DEVNULL)
   self.assertEqual(r.returncode,0,r.stderr+r.stdout)
   state=self.d/'etc/l2tp-vless'
   self.assertEqual((state/'bypass-ports').read_text(),'1112\n2000-2010\n')
@@ -144,7 +144,7 @@ class LifecycleTests(unittest.TestCase):
   self.assertTrue(any((b/'bypass-ports').exists() for b in (state/'backups').iterdir()))
   # Invalid input is rejected without touching the saved list.
   bad=dict(self.env,L2TP_BYPASS_PORTS='70000')
-  r=subprocess.run(['/bin/sh',str(self.installer)],env=bad,text=True,errors='replace',capture_output=True)
+  r=subprocess.run(['/bin/sh',str(self.installer)],env=bad,text=True,errors='replace',capture_output=True,stdin=subprocess.DEVNULL)
   self.assertNotEqual(r.returncode,0)
   self.assertEqual((state/'bypass-ports').read_text(),'1112\n2000-2010\n')
   # Changed later through the management command, without reinstalling.
@@ -164,9 +164,9 @@ class LifecycleTests(unittest.TestCase):
  def test_clearing_ports_on_reinstall(self):
   env=self.env.copy()
   env.update(L2TP_SERVER='l2tp.example.net',L2TP_USER='u',L2TP_PASS='p',L2TP_BYPASS_PORTS='1112')
-  self.assertEqual(subprocess.run(['/bin/sh',str(self.installer)],env=env,capture_output=True).returncode,0)
+  self.assertEqual(subprocess.run(['/bin/sh',str(self.installer)],env=env,capture_output=True,stdin=subprocess.DEVNULL).returncode,0)
   env=dict(self.env,L2TP_BYPASS_PORTS='0')
-  r=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True)
+  r=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True,stdin=subprocess.DEVNULL)
   self.assertEqual(r.returncode,0,r.stderr+r.stdout)
   self.assertFalse((self.d/'etc/l2tp-vless/bypass-ports').exists())
   self.assertNotIn('ct mark set 0x24682',self.model()['rules'])
@@ -230,7 +230,7 @@ class LifecycleTests(unittest.TestCase):
   (self.d/'etc/ppp/options.l2tp-vless').write_text('name x\n')
   (self.d/'etc/ppp/chap-secrets').write_text('"DOMAIN\\\\ops" * "pw" *\n')
   env=dict(self.env,L2TP_USER='DOMAIN\\ops')
-  r=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True)
+  r=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True,stdin=subprocess.DEVNULL)
   self.assertEqual(r.returncode,0,r.stderr+r.stdout)
   self.assertEqual((state/'password').read_text(),'pw\n')
  def test_update_works_before_first_install_wrote_state(self):
@@ -263,9 +263,13 @@ class LifecycleTests(unittest.TestCase):
   self.patch_model(public_ip='192.0.2.10')
   failed=self.install(first=False,okay=False)
   self.assertIn('原生地址',failed.stderr)
+  state=self.d/'etc/l2tp-vless'
+  self.assertFalse((state/'installed-version').exists())
+  good_rollback=(state/'rollback-path').read_text()
   self.patch_model(public_ip='198.51.100.10',bad_src=True)
   leaked=self.install(first=False,okay=False)
   self.assertIn('源地址',leaked.stderr)
+  self.assertEqual((state/'rollback-path').read_text(),good_rollback)
  def patch_model(self,**kwargs):
   model=self.model(); model.update(kwargs)
   (self.d/'model.json').write_text(json.dumps(model))
@@ -301,8 +305,12 @@ class LifecycleTests(unittest.TestCase):
   # After an SSH drop every write to the terminal fails; /dev/full fails writes the same way.
   env=self.env.copy()
   env.update(L2TP_SERVER=' l2tp.example.net ',L2TP_USER='u',L2TP_PASS='p')
-  with open('/dev/full','w') as full:
-   r=subprocess.run(['/bin/sh',str(self.installer)],env=env,stdout=full,stderr=subprocess.PIPE,text=True,errors='replace')
+  try:
+   with open('/dev/full','w') as full:
+    r=subprocess.run(['/bin/sh',str(self.installer)],env=env,stdout=full,stderr=subprocess.PIPE,text=True,errors='replace',stdin=subprocess.DEVNULL)
+  except PermissionError:
+   with open('/dev/null','r') as ro:
+    r=subprocess.run(['/bin/sh',str(self.installer)],env=env,stdout=ro,stderr=subprocess.PIPE,text=True,errors='replace',stdin=subprocess.DEVNULL)
   self.assertEqual(r.returncode,0,r.stderr)
   self.assertEqual((self.d/'etc/l2tp-vless/installed-version').read_text().strip(),'2.1.0')
   # Pasted spaces around the server are dropped rather than rejected.
@@ -321,7 +329,7 @@ class LifecycleTests(unittest.TestCase):
   user='DOMAIN\\ops user'
   env=self.env.copy()
   env.update(L2TP_SERVER='l2tp.example.net',L2TP_USER=user,L2TP_PASS=password)
-  result=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True)
+  result=subprocess.run(['/bin/sh',str(self.installer)],env=env,text=True,errors='replace',capture_output=True,stdin=subprocess.DEVNULL)
   self.assertEqual(result.returncode,0,result.stderr+result.stdout)
   self.assertFalse(marker.exists())
   options=(self.d/'etc/l2tp-vless/options').read_text()

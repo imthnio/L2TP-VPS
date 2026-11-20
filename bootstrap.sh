@@ -29,7 +29,8 @@ fetch() {
   curl -4 --noproxy '*' --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 10 --max-time 60 --retry 1 -o "$dest" "$url" && return 0
   # 旧版（v1）允许"绑定原生 IP"的连接直接出去。这里只借这个口子下载本仓库的文件，
   # 不会删除旧版的保护规则，也不会给普通程序开口子。
-  nic=$(ip -4 route show default table main | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
+  nic=$(ip -4 route show default table main | awk '$0 !~ / dev (ppp|l2tp-aa)/ {for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
+  [ -n "$nic" ] || return 1
   addr=$(ip -4 -o addr show dev "$nic" scope global | awk 'NR==1{split($4,a,"/");print a[1]}')
   [ -n "$addr" ] || return 1
   host=${url#https://}; host=${host%%/*}

@@ -40,7 +40,7 @@ BACKUP=
 # SSH 断开后终端已关闭，再往屏幕打印会出错；在 set -e 下这会让安装半途退出，上面忽略 HUP 就白做了。
 # 所以打印失败一律忽略，安装照常做完。
 fatal() { printf '[出错] %s\n' "$*" >&2 2>/dev/null || true; exit 1; }
-info() { printf '[L2TP-VPS] %s\n' "$*" 2>/dev/null || true; }
+info() { (printf '[L2TP-VPS] %s\n' "$*") 2>/dev/null || true; }
 # ---------- 第 1 步：检查运行环境 ----------
 # 只支持 Linux；必须是 root；Debian/Ubuntu 需要正在运行的 systemd，Alpine 需要 OpenRC。
 [ "$(uname -s)" = Linux ] || fatal '只支持 Linux VPS'
@@ -82,11 +82,11 @@ value() { sed -n "s/^$2=//p" "$1" | head -1; }
 if [ -f "$STATE/net.env" ] && [ ! -f "$STATE/v2-owned" ]; then LEGACY=1; fi
 [ ! -f "$STATE/legacy-pending" ] || LEGACY=1
 old_server=; old_user=; old_pass=
-if [ -f "$STATE/password" ]; then
+if [ -f "$STATE/password" ] || [ -f "$STATE/server" ] || [ -f "$STATE/user" ]; then
   # 某个文件缺了（比如上次恰好写到一半）就当作没保存，稍后重新询问，而不是直接报错退出。
   old_server=$(cat "$STATE/server" 2>/dev/null || true)
   old_user=$(cat "$STATE/user" 2>/dev/null || true)
-  old_pass=$(cat "$STATE/password")
+  old_pass=$(cat "$STATE/password" 2>/dev/null || true)
 elif [ "$LEGACY" = 1 ]; then
   old_server=$(value "$STATE/net.env" SERVER_IP)
   old_user=$(awk '$1=="name" {print $2; exit}' /etc/ppp/options.l2tp-vless 2>/dev/null || true)
@@ -322,6 +322,9 @@ done
 if [ -f "$BACKUP/install.sh" ] && [ -f "$BACKUP/installed-version" ]; then
   printf '%s\n' "$BACKUP" > "$STATE/rollback-path"
 fi
+# 备份完成后先拿掉"已安装完成"标记，全部验收通过后再写回：
+# 若本次升级中途失败，status 不会误报成功，下次重跑也能询问是否重填账号，且不会用半成品冲掉回滚快照。
+rm -f "$STATE/installed-version"
 # 每次安装/升级都会多一份备份，里面有密码。只留最近 10 份，再加上 rollback 要用的那一份，更早的删掉，
 # 免得旧密码一直堆在硬盘上。只删本脚本自己起名的目录（时间-进程号），别的东西不碰。
 keep=$(cat "$STATE/rollback-path" 2>/dev/null || true)
@@ -361,10 +364,13 @@ case "$SERVER" in
       function valid(x, a,n,i) { n=split(x,a,"."); if(n!=4)return 0; for(i=1;i<=4;i++)if(a[i]!~/^[0-9]+$/||a[i]>255)return 0; return 1 }
       valid($1) { print $1; exit }' || true)
     if [ -z "$resolved" ]; then
-      resolved=$({ timeout 15 nslookup -type=A "$SERVER" 1.1.1.1 || timeout 15 nslookup -type=A "$SERVER" 9.9.9.9; } 2>/dev/null | awk '
-        function valid(x, a,n,i) { n=split(x,a,"."); if(n!=4)return 0; for(i=1;i<=4;i++)if(a[i]!~/^[0-9]+$/||a[i]>255)return 0; return 1 }
-        /^Name:/ { answer=1 }
-        answer && /^Address/ { for (i=1; i<=NF; i++) if (valid($i)) { print $i; exit } }' || true)
+      for ns in 1.1.1.1 9.9.9.9; do
+        resolved=$(timeout 15 nslookup -type=A "$SERVER" "$ns" 2>/dev/null | awk '
+          function valid(x, a,n,i) { n=split(x,a,"."); if(n!=4)return 0; for(i=1;i<=4;i++)if(a[i]!~/^[0-9]+$/||a[i]>255)return 0; return 1 }
+          /^Name:/ { answer=1 }
+          answer && /^Address/ { for (i=1; i<=NF; i++) if (valid($i)) { print $i; exit } }' || true)
+        [ -z "$resolved" ] || break
+      done
     fi
     [ -z "$resolved" ] || ENDPOINT=$resolved;;
   *) ENDPOINT=$SERVER;;
@@ -548,6 +554,7 @@ supervisor="supervise-daemon"
 respawn_delay=10
 pidfile="/run/l2tp-vps-watch.pid"
 depend() { need l2tp-vps; }
+start_pre() { [ ! -f /etc/l2tp-vless/disabled ]; }
 EOF
   chmod 755 /etc/init.d/l2tp-vps /etc/init.d/l2tp-vps-guard /etc/init.d/l2tp-vps-watch
 fi
@@ -688,6 +695,11 @@ from_native=$(ip -4 route get 1.1.1.1 from "$NATIVE_IP" 2>/dev/null || true)
 printf '%s\n' "$from_native" | grep -q "dev $PEER" || fatal '绑定 VPS 原地址的连接没有走 L2TP；节点出口会仍是 VPS'
 bound=$(curl -4 --noproxy '*' --interface "$NATIVE_IP" -fsS --connect-timeout 10 --max-time 20 https://api.ipify.org || curl -4 --noproxy '*' --interface "$NATIVE_IP" -fsS --connect-timeout 10 --max-time 20 https://ifconfig.me || true)
 bound=$(printf '%s' "$bound" | tr -d '[:space:]')
+if ! printf '%s\n' "$bound" | awk -F. 'NF!=4{exit 1}{for(i=1;i<=4;i++)if($i!~/^[0-9]+$/||$i>255)exit 1}'; then
+  trace=$(curl -4 --noproxy '*' --interface "$NATIVE_IP" -kfsS --connect-timeout 10 --max-time 20 https://1.1.1.1/cdn-cgi/trace || true)
+  bound=$(printf '%s\n' "$trace" | awk -F= '$1=="ip" {print $2; exit}')
+  bound=$(printf '%s' "$bound" | tr -d '[:space:]')
+fi
 printf '%s\n' "$bound" | awk -F. 'NF!=4{exit 1}{for(i=1;i<=4;i++)if($i!~/^[0-9]+$/||$i>255)exit 1}' || fatal '绑定 VPS 原地址后无法经隧道访问外网'
 [ "$bound" != "$NATIVE_IP" ] || fatal '绑定 VPS 原地址的连接出口仍是 VPS'
 # 4. 如果 VPS 有原生 IPv6，确认 IPv6 不会从原生地址出去。
@@ -708,7 +720,7 @@ if [ -n "$BYPASS_PORTS" ]; then
 fi
 # 全部通过：记下版本号，保存这份安装器（以后 rollback 用），打印结果。SUCCESS=1 让 finish 不再报失败。
 printf '%s\n' "$VERSION" > "$STATE/installed-version"
-if [ -f "$0" ]; then cp "$0" "$STATE/install.sh"; chmod 600 "$STATE/install.sh"; fi
+if [ -f "$0" ]; then cp "$0" "$STATE/install.sh.new" && chmod 600 "$STATE/install.sh.new" && mv "$STATE/install.sh.new" "$STATE/install.sh"; fi
 info "安装/升级成功：${VERSION}；公网出口 ${out}，不是 VPS 原生地址"
 info "本机新连接和节点出站都走 L2TP。SSH 与节点端口仍使用 VPS 原地址 ${NATIVE_IP}。"
 info '以后重复运行 README 安装命令，或运行 sudo l2tp-vps update，即可升级并保留账号。'
